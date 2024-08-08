@@ -298,8 +298,6 @@ async def async_serialize(
         chunk_layout=chunk_layout,
         transaction=transaction,
     )
-    time.sleep(0.5)
-    print(open_future.result())
     # Asynchronous case.
     if commit_future is not None:
       assert isinstance(commit_future, list)
@@ -321,7 +319,6 @@ async def async_serialize(
       chunk_layout=chunk_layout,
       transaction=transaction,
   )
-  print(t)
 
   async def _write_array(shard):
     if shard.replica_id == replica_id:

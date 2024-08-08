@@ -40,7 +40,15 @@ import numpy as np
 import tensorstore as ts
 
 
-TS_CONTEXT = ts.Context({'file_io_concurrency': {'limit': 128}})
+TS_CONTEXT = ts.Context({
+  'file_io_concurrency': {'limit': 128},
+  'cache_pool': {'total_bytes_limit': 10_000_000_000}, # 10 GB RAM limit
+  'cache_pool#remote': {'total_bytes_limit': 10_000_000_000},
+  'data_copy_concurrency': {'limit': 128}
+})
+TS_CHUNK_LAYOUT = ts.ChunkLayout({
+  "chunk": {"elements": 100_000_000}, # 100M (800MB for float64) file size
+})
 _REMOVED_VALUE = 'Value removed'
 _CHECKPOINT_SUCCESS = 'checkpoint_write_success'
 _module_unique_count = itertools.count()
@@ -79,6 +87,23 @@ async def create_async_array_from_callback(
   return array.make_array_from_single_device_arrays(
       global_shape, inp_sharding, dbs)
 
+def _set_optimized_tensorspec(ts: dict[str, Any]) -> dict[str, Any]:
+  # we always use zarr3 in defaults
+  ts["driver"] = "zarr3" 
+
+  # remove all extra metadata fields, chunking is specified on top level
+  if "metadata" in ts:
+    assert "shape" in ts["metadata"], ("At a minimum `shape` must be present in"
+                                       " metadata.")
+    ts["metadata"] = {"shape": ts["metadata"]["shape"]}
+
+  # cloud storage should get compressed, local storage no compression
+  if ts["kvstore"].get("driver", "") in ("gcs", "s3"):
+    ts["metadata"]["codecs"] = [{"name": "crc32c"}, {"name": "zstd"}]
+  else:
+    ts["metadata"]["codecs"] = [{"name": "crc32c"}]
+
+  return ts
 
 def _get_metadata(arr):
   local_shape = arr.addressable_data(0).shape
@@ -100,30 +125,39 @@ def _get_kvstore_for_gcs(ckpt_path: str):
   if m is None:
     raise ValueError('The ckpt_path should contain the bucket name and the '
                       f'file path inside the bucket. Got: {ckpt_path}')
-  gcs_bucket = m.group(1)
+  bucket = m.group(1)
   path_without_bucket = m.group(2)
-  return {'driver': 'gcs', 'bucket': gcs_bucket, 'path': path_without_bucket}
+  return {'driver': 'gcs', 'bucket': bucket, 'path': path_without_bucket}
+
+def _get_kvstore_for_s3(ckpt_path: str):
+  m = re.fullmatch('^s3://([^/]*)/(.*)$', ckpt_path, re.DOTALL)
+  if m is None:
+    raise ValueError('The ckpt_path should contain the bucket name and the '
+                      f'file path inside the bucket. Got: {ckpt_path}')
+  bucket = m.group(1)
+  path_without_bucket = m.group(2)
+  return {'driver': 's3', 'bucket': bucket, 'path': path_without_bucket}
 
 def get_tensorstore_spec(ckpt_path: str, ocdbt: bool = False):
   # Normalize path to exclude trailing '/'. In GCS path case, we will need to
   # fix the path prefix to add back the stripped '/'.
-  ckpt_path = os.path.normpath(ckpt_path).replace('gs:/', 'gs://')
+  ckpt_path = re.sub(r"^gs:/", r"gs://", os.path.normpath(ckpt_path))
+  ckpt_path = re.sub(r"^s3:/", r"s3://", ckpt_path)
   is_gcs_path = ckpt_path.startswith('gs://')
-  spec = {'driver': 'zarr', 'kvstore': {}}
+  is_s3_path = ckpt_path.startswith('s3://')
+  spec = {'driver': 'zarr3', 'kvstore': {}}
+  if is_gcs_path:
+    base_kvstore = _get_kvstore_for_gcs(ckpt_path)
+  elif is_s3_path:
+    base_kvstore = _get_kvstore_for_s3(ckpt_path)
+  else:
+    base_kvstore = {'driver': _DEFAULT_DRIVER, 'path': ckpt_path}
   if ocdbt:
     if not is_gcs_path and not os.path.isabs(ckpt_path):
       raise ValueError(f'Checkpoint path should be absolute. Got {ckpt_path}')
-    base_path = os.path.dirname(ckpt_path)
-    spec['kvstore'] = {
-        'driver': 'ocdbt',
-        'base': base_path if is_gcs_path else f'{_DEFAULT_DRIVER}://{base_path}',
-        'path': os.path.basename(ckpt_path),
-    }
+    spec['kvstore'] = {'driver': 'ocdbt', 'base': base_kvstore}
   else:
-    if is_gcs_path:
-      spec['kvstore'] = _get_kvstore_for_gcs(ckpt_path)
-    else:
-      spec['kvstore'] = {'driver': _DEFAULT_DRIVER, 'path': ckpt_path}
+    spec['kvstore'] = base_kvstore
 
   return spec
 
@@ -207,6 +241,7 @@ async def async_serialize(
     tensorstore_spec,
     commit_future=None,
     context=TS_CONTEXT,
+    chunk_layout=TS_CHUNK_LAYOUT,
     primary_host: int | None = 0,
     replica_id: int = 0,
     transaction: Optional[ts.Transaction] = None,
@@ -240,6 +275,7 @@ async def async_serialize(
   # a 'cast' driver).
   if not _spec_has_metadata(tensorstore_spec):
     tensorstore_spec['metadata'] = _get_metadata(arr_inp)
+  _set_optimized_tensorspec(tensorstore_spec)
 
   # Set dtype if it's not in spec
   if 'dtype' not in tensorstore_spec:
@@ -253,6 +289,7 @@ async def async_serialize(
         create=True,
         open=True,
         context=context,
+        chunk_layout=chunk_layout,
         transaction=transaction,
     )
     # Asynchronous case.
@@ -273,6 +310,7 @@ async def async_serialize(
       open=True,
       assume_metadata=True,
       context=context,
+      chunk_layout=chunk_layout,
       transaction=transaction,
   )
 
@@ -349,6 +387,7 @@ async def async_deserialize(
     dtype=None,
     byte_limiter: _LimitInFlightBytes | None = None,
     context=TS_CONTEXT,
+    chunk_layout=TS_CHUNK_LAYOUT,
     assume_metadata: bool = False,
 ):
   in_sharding = (user_in_sharding.sharding
@@ -364,6 +403,7 @@ async def async_deserialize(
       open=True,
       assume_metadata=assume_metadata,
       context=context,
+      chunk_layout=chunk_layout,
   )
   shape = t.shape if global_shape is None else global_shape
   new_shard_shape = in_sharding.shard_shape(tuple(shape))
@@ -545,8 +585,9 @@ class AsyncManager:
                     current_process)
 
       if current_process == 0:
-        self._on_commit_callback()
-        logger.info('on_commit_callback successfully ran!')
+        if self._on_commit_callback is not None:
+          self._on_commit_callback()
+          logger.info('on_commit_callback successfully ran!')
         if process_count > 1:
           self._client.key_value_set(key_for_barrier, _CHECKPOINT_SUCCESS)
           logger.info('Process 0 successfully set key %s in the kv store',
@@ -650,7 +691,6 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
           tensorstore_specs,
       )
       return await asyncio.gather(*future_writer)
-
     asyncio.run(_run_serializer())
 
     self._add_futures(commit_futures)
@@ -664,11 +704,11 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
       arrays: Sequence[jax.Array],
       paths: Sequence[str],
       *,
-      on_commit_callback,
+      on_commit_callback: Optional[Callable] = None,
       transaction: Optional[ts.Transaction] = None,
   ):
     tspecs = jax.tree.map(get_tensorstore_spec, paths)
-    self.serialize(
+    return self.serialize(
         arrays,
         tspecs,
         on_commit_callback=on_commit_callback,

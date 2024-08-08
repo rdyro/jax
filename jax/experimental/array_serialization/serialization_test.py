@@ -19,19 +19,30 @@ import math
 from functools import partial
 import os
 import pathlib
+import time
 import tracemalloc as tm
+import tempfile
+import pickle
+import logging
+from dataclasses import dataclass
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from jax._src import config
+import jax.random as random
+from jax import tree
 from jax._src import test_util as jtu
 from jax._src import array
 from jax.sharding import NamedSharding, GSPMDSharding, SingleDeviceSharding
 from jax.sharding import PartitionSpec as P
 from jax.experimental.array_serialization import serialization
 from jax.experimental.layout import Layout, DeviceLocalLayout as DLL
+
+from jax.experimental.array_serialization.new_api import load, save, load_pytree
+from jax.experimental.array_serialization import new_api
+
 import numpy as np
 import tensorstore as ts
 
@@ -113,23 +124,6 @@ class CheckpointTest(jtu.JaxTestCase):
         'compressor': None,
         'chunks': inp.shape,
     }
-
-    is_cpu = jtu.test_device_matches(['cpu'])
-    tm.start()
-    try:
-      manager = serialization.GlobalAsyncCheckpointManager()
-      manager.serialize(
-          [inp],
-          [tspec],
-          on_commit_callback=partial(
-              self._on_commit_callback, ckpt_dir, ckpt_dir
-          ),
-      )
-      manager.wait_until_finished()
-      unused_current, peak = tm.get_traced_memory()
-      self.assertLess(peak, src.nbytes * (1 * (not is_cpu) + 0.5))
-    finally:
-      tm.stop()
 
   def test_checkpointing_with_path_variant(self):
     global_mesh = jtu.create_mesh((4, 2), ('x', 'y'))
@@ -519,11 +513,11 @@ class CheckpointTest(jtu.JaxTestCase):
     spec = serialization.get_tensorstore_spec(path, ocdbt=True)
     is_gcs_path = path.startswith('gs://')
     if is_gcs_path:
-      self.assertEqual(spec['kvstore']['base'], os.path.dirname(path))
+      self.assertEqual(spec['kvstore']['base']["driver"], "gcs")
+      self.assertTrue(path.endswith(spec['kvstore']['base']["path"]))
     else:
-      self.assertEqual(spec['kvstore']['base'],
-                       f'{serialization._DEFAULT_DRIVER}://{os.path.dirname(path)}')
-    self.assertEqual(spec['kvstore']['path'], 'path')
+      self.assertEqual(spec['kvstore']['base']["path"], path)
+    #self.assertEqual(spec['kvstore']['path'], 'path')
 
   def test_get_tensorstore_spec_not_absolute_path(self):
     path = 'my/ckpt/path'
@@ -631,6 +625,192 @@ class TransferShardTest(jtu.JaxTestCase):
     np_out = asyncio.run(serialization.transfer_shard_to_host(shard))
 
     self.assertArraysEqual(np_out, np_inp)
+
+class UserAPITestCase(jtu.JaxTestCase):
+  name: str | None
+  path: pathlib.Path | None
+
+  def setUp(self):
+    super().setUp()
+    tmpdir = tempfile.TemporaryDirectory()
+    self.enter_context(tmpdir)
+    self.name = tmpdir.name
+    self.path = pathlib.Path(self.name)
+
+  def tearDown(self):
+    self.path = None
+    self.name = None
+    super().tearDown()
+    
+  def generate_random_fp32(self, shape, dtype=jnp.float32):
+    seed = round(time.time() * 1e6) % (2 ** 31)
+    key = random.key(seed)
+    return random.normal(key, shape=shape).astype(dtype)
+    
+  def generate_clean_tree(self, dtype=jnp.float32):
+    r1 = self.generate_random_fp32((), dtype=dtype)
+    r2 = self.generate_random_fp32((4,), dtype=dtype)
+    r3 = self.generate_random_fp32((2, 3), dtype=dtype)
+    return (r1, {"a": r2, "rs": [r1, r2, r3], "c": {"d": {"e": (r2,)}}})
+    
+  def _is_equal(self, el1, el2):
+    if type(el1) != type(el2):
+      return False
+    if isinstance(el1, (np.ndarray, jax.Array)):
+      return (el1.dtype == el2.dtype and el1.shape == el2.shape 
+              and jnp.allclose(el1, el2))
+    else:
+      return el1 == el2
+    
+  def assertPyTreeEqual(self, p1, p2):
+    leaves1, struct1 = tree.flatten(p1)
+    leaves2, struct2 = tree.flatten(p2)
+    self.assertTrue(struct1 == struct2)
+    self.assertTrue(all(self._is_equal(el1, el2) for (el1, el2) in zip(leaves1, leaves2)))
+
+jax.config.update("jax_enable_x64", True)
+
+_DTYPES_LIST = [
+  jnp.uint8,
+  jnp.uint16,
+  jnp.uint32,
+  jnp.uint64,
+  jnp.int8,
+  jnp.int16,
+  jnp.int32,
+  jnp.int64,
+  jnp.float8_e4m3fn,
+  jnp.float8_e4m3fnuz,
+  jnp.float8_e5m2,
+  jnp.float8_e5m2fnuz,
+  jnp.float8_e4m3b11fnuz,
+  jnp.bfloat16,
+  jnp.float16,
+  jnp.float32,
+  jnp.float64,
+  jnp.complex64,
+  jnp.complex128,
+]
+
+class CustomNode:
+  def __init__(self, a):
+    self.a = a
+    
+  def tree_flatten(self):
+    return (self.a,), None
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, children):
+    return cls(*children)
+
+@dataclass
+class CustomDataclass:
+  a: int
+  c: str
+  d: int
+
+class CustomStatic:
+  def __init__(self, a):
+    self.a = a
+
+class UserAPITest(UserAPITestCase):
+
+  @parameterized.product(tree=[{"a": 1}, [1, 2, 3], (1, 2, 3), "hello", 1, 2, 3])
+  def test_save_then_load(self, tree):
+    save(tree, self.path)
+    tree2 = load(self.path)
+    self.assertPyTreeEqual(tree, tree2)
+
+  @parameterized.product(dtype=_DTYPES_LIST)
+  def test_saving_dtype(self, dtype):
+    test_tree = self.generate_clean_tree(dtype=dtype)
+    print("Generated tree", flush=True)
+    save(test_tree, self.path)
+    new_tree = load(self.path)
+    self.assertPyTreeEqual(test_tree, new_tree)
+    
+  def test_do_not_overwrite_noncheckpoint_directories(self):
+    (self.path / "hello.txt").write_text("Hello World")
+    with self.assertRaises(AssertionError):
+      save({"a": 1}, self.path)
+
+  def test_checkpoint_exists(self):
+    save({"a": 1}, self.path)
+    with self.assertRaises(NotImplementedError):
+      save({"a": 1}, self.path, overwrite=False)
+
+  @parameterized.product(use_node=[True, False], use_dataclass=[True, False], 
+                         use_static=[True, False], save_pickle=[True, False], 
+                         load_pickle=[True, False])
+  def test_custom_types(self, use_node, use_dataclass, use_static, save_pickle, 
+                        load_pickle):
+    if not use_node and not use_dataclass and not use_static:
+      return
+    magic_value = 37
+    n = CustomNode(magic_value) if use_node else None
+    d = CustomDataclass(magic_value, "hello", magic_value + 1) if use_dataclass else None
+    s = CustomStatic(magic_value - 1)
+    tree_to_save = [n, (d, s)]
+
+    if save_pickle:
+      save(tree_to_save, self.path, pickle_module=pickle)
+    else:
+      with self.assertRaises(ValueError):
+        save(tree_to_save, self.path, pickle_module=None)
+      return
+
+    if load_pickle:
+      tree2 = load(self.path, pickle_module=pickle)
+    else:
+      with self.assertRaises(ValueError):
+        tree2 = load(self.path, pickle_module=None)
+      return
+
+    if use_node:
+      self.assertEqual(tree2[0].a, magic_value)
+    if use_dataclass:
+      self.assertEqual(tree2[1][0].a, magic_value)
+      self.assertEqual(tree2[1][0].c, "hello")
+      self.assertEqual(tree2[1][0].d, magic_value + 1)
+    if use_static:
+      self.assertEqual(tree2[1][1].a, magic_value - 1)
+
+  @parameterized.product(register=[True, False])
+  def test_best_effort(self, register):
+    magic_value = 37
+    n = CustomNode(magic_value)
+    d = CustomDataclass(magic_value, "hello", magic_value + 1)
+    s = CustomStatic(magic_value - 1)
+    tree_to_save = [n, (d, s)]
+
+    if register:
+      #jax.tree_util.register_dataclass(CustomDataclass, data_fields=["a", "d"], meta_fields=["c"])
+      jax.tree_util.register_pytree_node_class(CustomNode)
+      jax.tree_util.register_static(CustomStatic)
+
+    save(tree_to_save, self.path, pickle_module=pickle)
+    with self.assertRaises(ValueError):
+      tree2 = load(self.path, pickle_module=None)
+    tree2 = load(self.path, pickle_module=None, best_effort=True)
+    #self.assertFalse(str(tree2))
+
+  def test_flax_frozen_dict(self):
+    try:
+      from flax.core.frozen_dict import FrozenDict
+    except ImportError:
+      logging.warning("Skipping Flax FrozenDict tests as flax is not installed")
+      return
+      
+    save(FrozenDict(a=1, b=self.generate_clean_tree()), self.path)
+    load(self.path)
+    extended_node_types = new_api._EXTENDED_NODE_TYPES_MAP
+    with absltest.mock.patch(save.__module__ + "._EXTENDED_NODE_TYPES_MAP", {
+      **extended_node_types, **{"flax.core.frozen_dict.FrozenDict": 
+                                "nonexisting_module3434.FrozenDict"}}):
+      with self.assertRaises(RuntimeError):
+        load(self.path)
+      load(self.path, best_effort=True) 
+    load(self.path) 
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

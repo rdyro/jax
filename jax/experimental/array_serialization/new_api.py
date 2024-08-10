@@ -76,7 +76,8 @@ def _obj_serialize(x: Any, path: PathLike, use_pickle: bool) -> str:
     except TypeError: # object is not JSON serializable
       if not use_pickle:
         raise ValueError(
-          f"Object cannot be serialized using JSON, use_pickle=`{use_pickle}`")
+          "An object cannot be serialized using JSON, your pytree contains a"
+          f" non-serializable object: {x}. Consider using `permissive=True`")
       else:
         Path(path).write_bytes(pickle.dumps(x))
         return ".pickle"

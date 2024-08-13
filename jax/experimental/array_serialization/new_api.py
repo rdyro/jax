@@ -15,15 +15,18 @@
 from __future__ import annotations
 
 from os import PathLike
-from typing import Any, Sequence
+from typing import Any, Sequence, TypeVar
 from uuid import uuid4
 import json
 import asyncio
+import time
 import threading
 import shutil
 import pickle
+import functools
 import logging
 from dataclasses import dataclass
+import inspect
 
 import jax
 from jax.tree_util import PyTreeDef, default_registry, treedef_is_leaf
@@ -39,12 +42,14 @@ _PYTREEDEF_FILE = "pytreedef.json"
 _TENSORSTORE_SUFFIX = ".tensorstore"
 _LEAF_DATA_DIR = "leaf_data"
 _NODE_DATA_DIR = "node_data"
-_PERMISSIVE_TREE_METADATA = ["permissive", "flat_leaf_ids"]
+_TREE_REPR_KEY = "__jax_tree_repr"
+_LEAF_IDS_KEY = "__jax_leaf_ids"
 
 __all__ = ["save", "load", "load_pytree", "async_save", 
            "async_load", "async_load_pytree"]
 
-
+PyTreeT = Any
+PickleModule = pickle
 
 def _is_array_like(x: Any):
   return isinstance(x, (jax.Array, np.ndarray))
@@ -57,7 +62,8 @@ def _get_suffix(x: Any):
   else:
     return ".json"
 
-def _obj_serialize(x: Any, path: PathLike, use_pickle: bool) -> str:
+def _obj_serialize(x: Any, path: PathLike, 
+                   pickle_module: PickleModule | None = None) -> str:
   """Serialization method for NOT-array objects."""
   if _is_array_like(x):
     raise ValueError
@@ -74,16 +80,18 @@ def _obj_serialize(x: Any, path: PathLike, use_pickle: bool) -> str:
       Path(path).write_text(json.dumps(x))
       return ".json"
     except TypeError: # object is not JSON serializable
-      if not use_pickle:
+      if not pickle_module:
         raise ValueError(
           "An object cannot be serialized using JSON, your pytree contains a"
-          f" non-serializable object: {x}. Consider using `permissive=True`")
+          f" non-serializable object: {x}. Consider using"
+          " `pickle_module=pickle`")
       else:
-        Path(path).write_bytes(pickle.dumps(x))
+        Path(path).write_bytes(pickle_module.dumps(x))
         return ".pickle"
 
-def _obj_deserialize(path: PathLike, use_pickle: bool):
-  """Deserialization method for NOT-array objects."""
+def _obj_deserialize(path: PathLike, pickle_module: PickleModule | None = None, 
+                     best_effort: bool = False):
+  """Deserialization method for NON-array objects."""
   path = Path(path)
   suffix = path.suffix
   if _is_array_like(_TENSORSTORE_SUFFIX):
@@ -93,13 +101,17 @@ def _obj_deserialize(path: PathLike, use_pickle: bool):
   elif suffix == ".json":
     return json.loads(path.read_text())
   elif suffix == ".pickle":
-    if not use_pickle:
-      logging.warning(f"Pickle file encountered, but `{use_pickle=}`," 
-                      " we'll return raw bytes")
+    if not pickle_module and not best_effort:
+      raise ValueError(f"Pickle file encountered, but {pickle_module=}")
       return path.read_bytes()
+    raw_bytes = path.read_bytes()
+    if not pickle_module and best_effort:
+      return raw_bytes
     try:
-      return pickle.loads(path.read_bytes())
+      return pickle_module.loads(raw_bytes)
     except (pickle.PickleError, AttributeError):
+      raise ValueError(f"We couldn't deserialize obj at `{path.name}` using"
+                       f" {pickle_module=}")
       logging.warning("We couldn't deserialize %s, we'll return underlying" 
                       " bytes instead", path.stem)
       return path.read_bytes()
@@ -108,7 +120,7 @@ def _obj_deserialize(path: PathLike, use_pickle: bool):
 
 
 async def _read_node_store(path: PathLike):
-  """Unpickle all pickle files in the node_store - where node data lives."""
+  """Read all binary files into the node_store - where node data lives."""
   path = Path(path)
   if not path.exists() or not path.is_dir():
     return {}
@@ -130,11 +142,12 @@ def _is_pytree_strict_serializable(tree: PyTreeDef) -> bool:
 def _is_remote_path(path: str | PathLike):
   # we check whether a path is remote by checking the prefix
   # we need to truncate e.g., gs:// to gs:/ because pathlib.Path collapses //
-  return any(str(path).startswith(prefix[:-1]) for prefix in 
-             _REMOTE_URL_PREFIXES)
+  return any(str(path).startswith(prefix[:-1]) 
+             for prefix in _REMOTE_URL_PREFIXES)
 
-async def async_save(data: Any, directory: str | PathLike, 
-                     overwrite: bool = True, permissive: bool = False) -> None:
+async def async_save(data: PyTreeT, directory: str | PathLike, 
+                     overwrite: bool = True, 
+                     pickle_module: PickleModule | None = None) -> None:
   """Saves the given data structure to the provided directory path.
 
   This function provides functionality to serialize and save a data structure
@@ -142,7 +155,7 @@ async def async_save(data: Any, directory: str | PathLike,
   structure to a given directory. It leverages `PyTree` for flattening and
   reconstructing the data structure.
 
-  If `permissive` is enabled, we use pickle to serialize unknown types.
+  If `pickle_module` is provided, we use pickle to serialize unknown types.
 
   Args:
     data: The data structure to be saved. Arbitrary composition of JAX arrays, 
@@ -151,8 +164,8 @@ async def async_save(data: Any, directory: str | PathLike,
       a remote URL (e.g., gs://, s3://). For remote URLs, `etils` is required.
     overwrite: If True, any existing directory with the same name will be
       overwritten.
-    permissive: If True, uses a permissive serialization strategy that uses
-      cloudpickle to serialize any unsupported types.
+    pickle_module: If not None, uses a pickling serialization strategy that uses
+      the provided pickle_module to serialize any unsupported types.
   Raises:
     AssertionError: If attempting to save to a remote path without the `etils`
       package installed.
@@ -165,32 +178,43 @@ async def async_save(data: Any, directory: str | PathLike,
     " module installed. You can install it using `pip install etils`."
   )
   data_flat, pytreedef = tree.flatten(data)
-  if permissive:
-    serialize_pytree = PermissivePyTreeSerialization.serialize_pytree
-  else:
-    serialize_pytree = StrictPyTreeSerialization.serialize_pytree
+  serialize_pytree = PermissivePyTreeSerialization.serialize_pytree
+  #if pickle_module is not None:
+  #  serialize_pytree = PermissivePyTreeSerialization.serialize_pytree
+  #else:
+  #  serialize_pytree = StrictPyTreeSerialization.serialize_pytree
 
+  # overwrite or error
   root = Path(directory)
   if ((root / _PYTREEDEF_FILE).exists() 
       or (root.exists() and len(list(root.iterdir())) > 0)):
     if overwrite:
+      # check that we're only deleting things that come from JAX
+      # refuse to rm directories containing additional entries
+      paths_present = list(Path(directory).iterdir())
+      extra_member_paths = [path for path in paths_present if path.name not in 
+                            (_PYTREEDEF_FILE, _LEAF_DATA_DIR, _NODE_DATA_DIR)]
+      assert len(extra_member_paths) == 0, (
+        "Refusing to remove a directory that is not a previous checkpoint."
+        f" Unrecognized paths: {extra_member_paths}. Remove them manually if"
+        f" you're sure you want to use {root} as the checkpoint directory.")
       if _is_remote_path(directory):
         Path(directory).rmtree()
       else:
         shutil.rmtree(Path(directory))
     else:
       raise NotImplementedError("Another checkpoint already exists at path:"
-                                f" `{root}`, but you specified `overwrite ="
-                                " False`")
-  if not _is_remote_path(directory):
-    root.mkdir(exist_ok=True)
+                                f" `{root}`, but you specified `{overwrite=}`")
 
-  pytree_repr, leaf_ids, node_data_store = serialize_pytree(pytreedef)
+  if not _is_remote_path(directory):
+    root.mkdir(exist_ok=True) # do not make parents, that's too much
+
+  pytree_repr, leaf_ids, node_data_store = serialize_pytree(pytreedef, 
+                                                            pickle_module)
   leaf_ids_flat = tree.flatten(leaf_ids)[0]
   (root / _PYTREEDEF_FILE).write_text(json.dumps(pytree_repr, indent=2))
   paths = [root / _LEAF_DATA_DIR / f"{leaf_id}{_get_suffix(data)}"
                    for leaf_id, data in zip(leaf_ids_flat, data_flat)]
-
 
   # start serialization ##################################
 
@@ -200,8 +224,9 @@ async def async_save(data: Any, directory: str | PathLike,
   obj_paths = [path for path in paths if path.suffix != _TENSORSTORE_SUFFIX]
   obj_serialize_futures = []
   for data, path in zip(obj_flat, obj_paths):
+    # each host has to read all binary files
     obj_serialize_futures.append(asyncio.to_thread(_obj_serialize, data, path, 
-                                                   use_pickle=permissive))
+                                                   pickle_module=pickle_module))
 
   # 2. serialize arrays
   serialize_futures = []
@@ -213,19 +238,19 @@ async def async_save(data: Any, directory: str | PathLike,
                             for (arr, ts_spec) in zip(arr_flat, ts_specs)])
 
   # 3. serialize node data if permissive
-  if permissive:
+  if pickle_module is not None:
     for node_data_key, node_data_bytes in node_data_store.items():
       path = root / _NODE_DATA_DIR / f"{node_data_key}.pickle"
       serialize_futures.append(asyncio.to_thread(_obj_serialize, 
                                                  node_data_bytes, path, 
-                                                 use_pickle=True))
+                                                 pickle_module=pickle_module))
                       
-  # perhaps rename some objects if permissive is enabled and they turned out 
+  # perhaps rename some objects if pickle is provided and they turned out 
   # not to be JSON serializable (so we used pickle)
   _, obj_serialize_results = await asyncio.gather(
     asyncio.gather(*serialize_futures), asyncio.gather(*obj_serialize_futures))
   rename_futures = []
-  if permissive: # object suffixes might have changes
+  if pickle_module is not None: # object suffixes might have changed
     for path, obj_actual_suffix in zip(obj_paths, obj_serialize_results):
       if path.suffix != obj_actual_suffix:
         rename_futures.append(
@@ -237,8 +262,9 @@ async def async_save(data: Any, directory: str | PathLike,
 
 async def async_load(directory: str | PathLike, 
                      shardings: Sequence | None = None, 
-                     pytree: Any | None = None,
-                     use_pickle: bool = True) -> Any:
+                     pytree: PyTreeT | None = None,
+                     pickle_module: PickleModule | None = None,
+                     best_effort: bool = False) -> PyTreeT:
   """Loads and reconstructs a data structure from a directory.
 
   Args:
@@ -247,7 +273,9 @@ async def async_load(directory: str | PathLike,
       single device sharding on the default device.
     pytree: Optional pre-populated PyTree for structure. If provided, must 
       specify a pytree with string object ids. Useful for partial reads.
-    permissive: Whether to attempt to unpickle.
+    pickle_module: Pickle module supporting dumps and loads methods.
+    best_effort: Proceed with deserialization even in the face of partial 
+      failures.
   Returns:
     Reconstructed data structure.
   Raises:
@@ -265,15 +293,13 @@ async def async_load(directory: str | PathLike,
 
   # 1. deserialize PyTree (if permissive inserting node_data)
   if pytree is None:
-    pytreedef, permissive = (
-      await _async_load_pytree_and_check_permissive(directory, use_pickle))
+    pytreedef = await async_load_pytree(directory, pickle_module, best_effort)
     leaf_ids, pytreedef = tree.flatten(pytreedef)
   else:
-    permissive = True
     leaf_ids, pytreedef = tree.flatten(pytree)
   leaf_ids_set = set(leaf_ids)
   missing_leaf_ids = [leaf_id for leaf_id in leaf_ids 
-                   if leaf_id not in set(path.stem for path in data_paths)]
+                      if leaf_id not in set(path.stem for path in data_paths)]
   if len(missing_leaf_ids) > 0:
     raise ValueError(
       f"Values {missing_leaf_ids} are missing from thecheckpoint directory.")
@@ -281,8 +307,9 @@ async def async_load(directory: str | PathLike,
   # 2. deserialize non-array objects
   obj_paths = [path for path in data_paths 
                if path.suffix != _TENSORSTORE_SUFFIX]
-  objs = {path.stem: asyncio.to_thread(_obj_deserialize, path, use_pickle) 
-          for path in obj_paths if path.stem in leaf_ids_set}
+  objs = {path.stem: asyncio.to_thread(
+    _obj_deserialize, path, pickle_module, best_effort) for path in obj_paths 
+    if path.stem in leaf_ids_set}
 
   # 3. deserialize array objects
   arr_paths = [path for path in data_paths 
@@ -306,56 +333,70 @@ async def async_load(directory: str | PathLike,
 
   
 async def async_load_pytree(directory: str | PathLike, 
-                            use_pickle: bool = True) -> Any:
+                            pickle_module: PickleModule | None = None,
+                            best_effort: bool = False) -> PyTreeDef:
   """Loads a pytree from the given directory.
   Args:
     directory: Directory path to load from.
   Returns:
     The loaded pytree.
   """
-  return (await _async_load_pytree_and_check_permissive(directory, 
-                                                        use_pickle))[0]
-
-async def _async_load_pytree_and_check_permissive(
-    directory: str | PathLike, use_pickle: bool = True) -> Any:
   assert not _is_remote_path(directory) or epath_installed, (
     "For checkpointing using remote URLs (e.g., gs, s3) you need `etils`"
     " module installed. You can install it using `pip install etils`.")
   root = Path(directory)
   raw_tree = json.loads((root / _PYTREEDEF_FILE).read_text())
-  if raw_tree.get("permissive", False):
-    if use_pickle:
+  
+  # detect if the written tree is permissive or strict
+  if (isinstance(raw_tree, dict) and len(raw_tree) == 2 
+      and all(key for key in raw_tree for key in 
+              [_TREE_REPR_KEY, _LEAF_IDS_KEY])):
+    # the checkpoint is permissive, ostensibly it needs a pickler to load binary
+    # data, but the user might have used permissive mode to save 
+    # a strict / clean checkpoint, error lazily
+    if pickle_module is not None:
       node_data_store = await _read_node_store(root / _NODE_DATA_DIR)
+    elif (not best_effort and (root / _NODE_DATA_DIR).exists() 
+          and len(list((root / _NODE_DATA_DIR).iterdir())) > 0):
+      raise ValueError(
+        f"{_NODE_DATA_DIR} is not empty, but pickle_module is not provided and"
+        f" `{best_effort=}`. We cannot proceed.")
     else:
       node_data_store = dict()
-    return (PermissivePyTreeSerialization.deserialize_pytree(
-      raw_tree, node_data_store), True)
+    return PermissivePyTreeSerialization.deserialize_pytree(
+      raw_tree, node_data_store, pickle_module, best_effort)
   else:
-    # delete permissive tree metadata if present
-    for key in [k for k in _PERMISSIVE_TREE_METADATA if k in raw_tree]: 
-      del raw_tree[key]
-    return StrictPyTreeSerialization.deserialize_pytree(raw_tree), False
-    
-def _run_async_in_thread_wrapper(fn):
+    # the checkpoint is strict / not permissive
+    return StrictPyTreeSerialization.deserialize_pytree(raw_tree)
 
+def _maybe_run_async_sync(async_fn):
+  """Run async routine synchronously irrespective of the current environment."""
+  @functools.wraps(async_fn)
   def wrapped_fn(*args, **kw):
-    result = []
+    retval, exception = [None], [None]
 
-    def _async_run():
-      result.append(asyncio.run(fn(*args, **kw)))
+    def _run_in_thread():
+      async def _async_thread_run():
+        ret, exc = None, None
+        try:
+          ret = await async_fn(*args, **kw)
+        except Exception as e:
+          exc = e
+        return ret, exc
 
-    thread = threading.Thread(target=_async_run)
-    thread.start()
-    thread.join()
-    if len(result) == 0:
-      raise ValueError(f"Underlying async method failed: `{fn}`")
-    return result[0]
+      retval[0], exception[0] = asyncio.run(_async_thread_run())
 
+    t = threading.Thread(target=_run_in_thread)
+    t.start()
+    t.join()
+    if exception[0] is not None:
+      raise exception[0]
+    return retval[0]
   return wrapped_fn
-    
-load_pytree = _run_async_in_thread_wrapper(async_load_pytree)
-save = _run_async_in_thread_wrapper(async_save)
-load = _run_async_in_thread_wrapper(async_load)
+
+load_pytree = _maybe_run_async_sync(async_load_pytree)
+save = _maybe_run_async_sync(async_save)
+load = _maybe_run_async_sync(async_load)
   
 ################################################################################
 
@@ -380,22 +421,32 @@ def _encode_node_data(node_data, node_data_store: dict[str, Any]):
     node_data_store[node_data_key] = pickle.dumps(node_data)
     return (_cls2typerepr(node_data[0]), node_data_key)
 
-def _decode_node_data(node_data_encoded, node_data_store: dict[str, Any]):
+def _decode_node_data(node_data_encoded, node_data_store: dict[str, Any], 
+                      pickle_module: PickleModule, best_effort: bool):
   if node_data_encoded is None:
     return None
   elif node_data_encoded[0] in _BUILTINS_MAP:
     return (_BUILTINS_MAP[node_data_encoded[0]], node_data_encoded[1])
   else:
     node_data_key = node_data_encoded[1]
+    if not best_effort:
+      assert node_data_key in node_data_store, (
+        f"Node key {node_data_key} missing from node data store.")
     if node_data_key in node_data_store:
+      pickle_error = None
       try:
-        return pickle.loads(node_data_store[node_data_key])
-      except (pickle.UnpicklingError, AttributeError):
-        pass
+        assert pickle_module is not None
+        return pickle_module.loads(node_data_store[node_data_key])
+      except (pickle.UnpicklingError, AttributeError) as e:
+        pickle_error = e
     # fallback
-    logging.warning(f"Unrecognized data type {node_data_encoded[0]} we'll do"
-                    " our best and just return a list of children")
-    return (list, None)
+    if best_effort:
+      logging.warning(f"Unrecognized data type {node_data_encoded[0]} we'll do"
+                      " our best and just return a list of children")
+      return (list, None)
+    else:
+      raise pickle_error
+
 
 def _serialize_pytree_helper(node, node_data_store: dict[str, Any]):
   node_repr = dict()
@@ -413,20 +464,25 @@ def _serialize_pytree_helper(node, node_data_store: dict[str, Any]):
   else:
     node_repr["children"] = []
     assert node.num_leaves in (0, 1), (
-      "We only support 1 or 0 leaves (?) are a leaf")
+      "We only support 1 or 0 leaves (?) is this a leaf")
     node_repr["leaf_id"] = str(uuid4()) if node.num_leaves == 1 else None
     leaf_ids = node_repr["leaf_id"]
   return node_repr, leaf_ids
 
-def _deserialize_pytree_helper(node, node_data_store: dict[str, Any]):
+def _deserialize_pytree_helper(node, node_data_store: dict[str, Any],
+                               pickle_module: PickleModule | None, 
+                               best_effort: bool):
     assert "encoded_node_data" in node and "children" in node
     pytree_children = [_deserialize_pytree_helper(
-      child, node_data_store=node_data_store) for child in node["children"]]
-    node_data = _decode_node_data(node["encoded_node_data"], node_data_store)
+      child, node_data_store, pickle_module, best_effort) 
+      for child in node["children"]]
+    node_data = _decode_node_data(node["encoded_node_data"], node_data_store, 
+                                  pickle_module, best_effort)
     pt = PyTreeDef.make_from_node_data_and_children(default_registry, node_data,
                                                     tuple(pytree_children))
     return pt
 
+# serialize and deserialize pytree methods namespaces: permissive and strict
 class AbstractPyTreeSerialization:
   @staticmethod
   def serialize_pytree(node):
@@ -439,31 +495,41 @@ class AbstractPyTreeSerialization:
 
 class PermissivePyTreeSerialization(AbstractPyTreeSerialization):
   @staticmethod
-  def serialize_pytree(node):
+  def serialize_pytree(node, pickle_module: PickleModule | None = None):
     node_data_store = dict()
-    node_repr, leaf_ids = _serialize_pytree_helper(node, node_data_store)
-    node_repr["permissive"] = True
-    node_repr["flat_leaf_ids"] = tree.flatten(leaf_ids)[0]
+    tree_repr, leaf_ids = _serialize_pytree_helper(node, node_data_store)
+    node_repr = dict()
+    node_repr[_TREE_REPR_KEY] = tree_repr
+    node_repr[_LEAF_IDS_KEY] = tree.flatten(leaf_ids)[0]
     return node_repr, leaf_ids, node_data_store
 
   @staticmethod
   def deserialize_pytree(rawtree: dict[str, Any], 
-                         node_data_store: dict[str, Any] | None = None):
+                         node_data_store: dict[str, Any] | None = None,
+                         pickle_module: PickleModule | None = None,
+                         best_effort: bool = False):
     node_data_store = node_data_store or dict()
-    pt = _deserialize_pytree_helper(rawtree, node_data_store)
-    leaf_ids = rawtree["flat_leaf_ids"]
+    pt = _deserialize_pytree_helper(rawtree[_TREE_REPR_KEY], node_data_store, 
+                                    pickle_module, best_effort)
+    leaf_ids = rawtree[_LEAF_IDS_KEY]
     return tree.unflatten(pt, leaf_ids)
     
 class StrictPyTreeSerialization(AbstractPyTreeSerialization):
   @staticmethod
-  def serialize_pytree(node):
+  def serialize_pytree(node, pickle_module: PickleModule | None = None):
+    del pickle_module
     leaf_ids = [str(uuid4()) for _ in range(node.num_leaves)]
-    assert _is_pytree_strict_serializable(node)
+    _ = PyTreeDef.serialize_using_proto(node) # this raises a useful error
+    # alternatively: assert _is_pytree_strict_serializable(node)
     node_repr = tree.unflatten(node, leaf_ids)
-    node_repr["permissive"] = False
     return node_repr, leaf_ids, dict()
 
   @staticmethod
   def deserialize_pytree(rawtree: dict[str, Any], 
-                         node_data_store: dict[str, Any] | None = None):
+                         node_data_store: dict[str, Any] | None = None,
+                         pickle_module: PickleModule | None = None,
+                         best_effort: bool = False):
+    del node_data_store
+    del pickle_module
+    del best_effort
     return rawtree

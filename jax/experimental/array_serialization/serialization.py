@@ -148,22 +148,18 @@ def get_tensorstore_spec(ckpt_path: str, ocdbt: bool = False):
   is_gcs_path = ckpt_path.startswith('gs://')
   is_s3_path = ckpt_path.startswith('s3://')
   spec = {'driver': 'zarr3', 'kvstore': {}}
+  if is_gcs_path:
+    base_kvstore = _get_kvstore_for_gcs(ckpt_path)
+  elif is_s3_path:
+    base_kvstore = _get_kvstore_for_s3(ckpt_path)
+  else:
+    base_kvstore = {'driver': _DEFAULT_DRIVER, 'path': ckpt_path}
   if ocdbt:
     if not is_gcs_path and not os.path.isabs(ckpt_path):
       raise ValueError(f'Checkpoint path should be absolute. Got {ckpt_path}')
-    base_path = os.path.dirname(ckpt_path)
-    spec['kvstore'] = {
-        'driver': 'ocdbt',
-        'base': base_path if is_gcs_path else f'{_DEFAULT_DRIVER}://{base_path}',
-        'path': os.path.basename(ckpt_path),
-    }
+    spec['kvstore'] = {'driver': 'ocdbt', 'base': base_kvstore}
   else:
-    if is_gcs_path:
-      spec['kvstore'] = _get_kvstore_for_gcs(ckpt_path)
-    elif is_s3_path:
-      spec['kvstore'] = _get_kvstore_for_s3(ckpt_path)
-    else:
-      spec['kvstore'] = {'driver': _DEFAULT_DRIVER, 'path': ckpt_path}
+    spec['kvstore'] = base_kvstore
 
   return spec
 

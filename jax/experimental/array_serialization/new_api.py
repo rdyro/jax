@@ -31,6 +31,7 @@ import inspect
 import jax
 from jax.tree_util import PyTreeDef, default_registry, treedef_is_leaf
 from jax import tree
+from jax._src.util import safe_zip
 from jax.experimental.array_serialization import serialization
 from jax.experimental.array_serialization.serialization import get_tensorstore_spec
 from jax.experimental.array_serialization.serialization import _REMOTE_URL_PREFIXES
@@ -44,6 +45,7 @@ _LEAF_DATA_DIR = "leaf_data"
 _NODE_DATA_DIR = "node_data"
 _TREE_REPR_KEY = "__jax_tree_repr"
 _LEAF_IDS_KEY = "__jax_leaf_ids"
+_TYPE_ID_LEAF_DELIMITER = " -> "
 
 __all__ = ["save", "load", "load_pytree", "async_save", 
            "async_load", "async_load_pytree"]
@@ -117,7 +119,28 @@ def _obj_deserialize(path: PathLike, pickle_module: PickleModule | None = None,
       return path.read_bytes()
   else:
     raise ValueError(f"Suffix `{suffix}` deserialization is not supported.")
-
+    
+def _leaf_to_type_desc(leaf) -> str:
+  if leaf is None:
+    return "null"
+  elif isinstance(leaf, (np.ndarray, jax.Array)):
+    return f"{leaf.dtype.name}[{', '.join(map(str, leaf.shape))}]"
+  else:
+    return type(leaf).__name__
+    
+def _join_leaf_type_and_id(leaf_type: str, leaf_id: str) -> str:
+  return f"{leaf_type}{_TYPE_ID_LEAF_DELIMITER}{leaf_id}"
+    
+def _inscribe_leaf_types(pytree_repr: dict[str, Any], 
+                         leaf_id_type_map: dict[str, str]):
+  """Rewrite a JSON PyTree representation by adding type to leaf_id."""
+  if pytree_repr["node_type"] == "leaf":
+    leaf_id = pytree_repr["leaf_id"]
+    pytree_repr["leaf_id"] = _join_leaf_type_and_id(leaf_id_type_map[leaf_id], 
+                                                    leaf_id)
+  else:
+    _ = [_inscribe_leaf_types(child, leaf_id_type_map) 
+         for child in pytree_repr["children"]]
 
 async def _read_node_store(path: PathLike):
   """Read all binary files into the node_store - where node data lives."""
@@ -128,7 +151,7 @@ async def _read_node_store(path: PathLike):
            if path.is_file() and path.suffix == ".pickle"]
   contents = await asyncio.gather(*[asyncio.to_thread(
     lambda p: p.read_bytes(), path) for path in paths])
-  return {path.stem: data for (path, data) in zip(paths, contents)}
+  return {path.stem: data for (path, data) in safe_zip(paths, contents)}
 
 
 def _is_pytree_strict_serializable(tree: PyTreeDef) -> bool:
@@ -208,10 +231,20 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
 
   if not _is_remote_path(directory):
     root.mkdir(exist_ok=True) # do not make parents, that's too much
+    assert root.exists() and root.is_dir()
 
   pytree_repr, leaf_ids, node_data_store = serialize_pytree(pytreedef, 
                                                             pickle_module)
   leaf_ids_flat = tree.flatten(leaf_ids)[0]
+  # optionally inscribe types into leaf ids
+  leaf_ids_type_map = {leaf_id: _leaf_to_type_desc(leaf) for (leaf_id, leaf) 
+                       in safe_zip(leaf_ids_flat, data_flat)}
+  # in-place
+  _inscribe_leaf_types(pytree_repr[_TREE_REPR_KEY], leaf_ids_type_map) 
+  pytree_repr[_LEAF_IDS_KEY] = [
+    _join_leaf_type_and_id(leaf_ids_type_map[leaf_id], leaf_id) 
+    for leaf_id in leaf_ids_flat]
+
   (root / _PYTREEDEF_FILE).write_text(json.dumps(pytree_repr, indent=2))
   paths = [root / _LEAF_DATA_DIR / f"{leaf_id}{_get_suffix(data)}"
                    for leaf_id, data in zip(leaf_ids_flat, data_flat)]
@@ -297,6 +330,9 @@ async def async_load(directory: str | PathLike,
     leaf_ids, pytreedef = tree.flatten(pytreedef)
   else:
     leaf_ids, pytreedef = tree.flatten(pytree)
+  leaf_ids = [leaf_id.split(_TYPE_ID_LEAF_DELIMITER)[1]
+              if _TYPE_ID_LEAF_DELIMITER in leaf_id else leaf_id 
+              for leaf_id in leaf_ids]
   leaf_ids_set = set(leaf_ids)
   missing_leaf_ids = [leaf_id for leaf_id in leaf_ids 
                       if leaf_id not in set(path.stem for path in data_paths)]
@@ -411,73 +447,81 @@ _BUILTINS_SET = set(_BUILTINS_MAP.values())
 def _cls2typerepr(cls):
   return f"{cls.__module__}.{cls.__name__}"
   
-def _encode_node_data(node_data, node_data_store: dict[str, Any]):
+def _encode_node_data(node_data, node_data_store: dict[str, Any], 
+                      pickle_module: PickleModule | None):
   if node_data is None:
-    return None
+    return "leaf", None
   elif node_data[0] in _BUILTINS_SET:
     return (_cls2typerepr(node_data[0]), node_data[1])
   else:
     node_data_key = str(uuid4())
-    node_data_store[node_data_key] = pickle.dumps(node_data)
+    if pickle_module is None:
+      raise ValueError(
+        f"Node data `{node_data}` is not serializable without a pickle_module.")
+    node_data_store[node_data_key] = pickle_module.dumps(node_data)
     return (_cls2typerepr(node_data[0]), node_data_key)
 
-def _decode_node_data(node_data_encoded, node_data_store: dict[str, Any], 
+def _decode_node_data(node_type, node_data, node_data_store: dict[str, Any], 
                       pickle_module: PickleModule, best_effort: bool):
-  if node_data_encoded is None:
+  if node_type is None or node_type == "leaf":
     return None
-  elif node_data_encoded[0] in _BUILTINS_MAP:
-    return (_BUILTINS_MAP[node_data_encoded[0]], node_data_encoded[1])
+  elif node_type in _BUILTINS_MAP:
+    return (_BUILTINS_MAP[node_type], node_data)
   else:
-    node_data_key = node_data_encoded[1]
+    node_data_ref = node_data
     if not best_effort:
-      assert node_data_key in node_data_store, (
-        f"Node key {node_data_key} missing from node data store.")
-    if node_data_key in node_data_store:
+      assert node_data_ref in node_data_store, (
+        f"Node reference `{node_data_ref}` missing from node data store.")
+    if node_data_ref in node_data_store:
       pickle_error = None
       try:
         assert pickle_module is not None
-        return pickle_module.loads(node_data_store[node_data_key])
+        return pickle_module.loads(node_data_store[node_data_ref])
       except (pickle.UnpicklingError, AttributeError) as e:
         pickle_error = e
     # fallback
     if best_effort:
-      logging.warning(f"Unrecognized data type {node_data_encoded[0]} we'll do"
+      logging.warning(f"Unrecognized data type `{node_type}` we'll do"
                       " our best and just return a list of children")
       return (list, None)
     else:
       raise pickle_error
 
 
-def _serialize_pytree_helper(node, node_data_store: dict[str, Any]):
+def _serialize_pytree_helper(node, node_data_store: dict[str, Any], 
+                             pickle_module: PickleModule | None):
   node_repr = dict()
-  node_repr["encoded_node_data"] = _encode_node_data(node.node_data(), 
-                                                     node_data_store)
+  node_repr["node_type"], node_repr["node_data_ref"] = _encode_node_data(
+    node.node_data(), node_data_store, pickle_module)
   # this encodes if-and-only-if using not and xor
   assert not ((len(node.children()) == 0) ^ treedef_is_leaf(node))
 
   leaf_ids = None
   if not treedef_is_leaf(node):
     children, leaf_ids = zip(*[
-      _serialize_pytree_helper(child, node_data_store=node_data_store) 
+      _serialize_pytree_helper(child, node_data_store=node_data_store, 
+                               pickle_module=pickle_module) 
       for child in node.children()])
     node_repr["children"] = children
   else:
     node_repr["children"] = []
     assert node.num_leaves in (0, 1), (
       "We only support 1 or 0 leaves (?) is this a leaf")
-    node_repr["leaf_id"] = str(uuid4()) if node.num_leaves == 1 else None
+    leaf_id = str(uuid4()) if node.num_leaves == 1 else None
+    node_repr["leaf_id"] = leaf_id
     leaf_ids = node_repr["leaf_id"]
   return node_repr, leaf_ids
 
 def _deserialize_pytree_helper(node, node_data_store: dict[str, Any],
                                pickle_module: PickleModule | None, 
                                best_effort: bool):
-    assert "encoded_node_data" in node and "children" in node
+    assert ("node_type" in node and "node_data_ref" in node 
+            and "children" in node)
     pytree_children = [_deserialize_pytree_helper(
       child, node_data_store, pickle_module, best_effort) 
       for child in node["children"]]
-    node_data = _decode_node_data(node["encoded_node_data"], node_data_store, 
-                                  pickle_module, best_effort)
+    node_data = _decode_node_data(node["node_type"], node["node_data_ref"], 
+                                  node_data_store, pickle_module, best_effort)
     pt = PyTreeDef.make_from_node_data_and_children(default_registry, node_data,
                                                     tuple(pytree_children))
     return pt
@@ -497,7 +541,8 @@ class PermissivePyTreeSerialization(AbstractPyTreeSerialization):
   @staticmethod
   def serialize_pytree(node, pickle_module: PickleModule | None = None):
     node_data_store = dict()
-    tree_repr, leaf_ids = _serialize_pytree_helper(node, node_data_store)
+    tree_repr, leaf_ids = _serialize_pytree_helper(node, node_data_store, 
+                                                   pickle_module)
     node_repr = dict()
     node_repr[_TREE_REPR_KEY] = tree_repr
     node_repr[_LEAF_IDS_KEY] = tree.flatten(leaf_ids)[0]

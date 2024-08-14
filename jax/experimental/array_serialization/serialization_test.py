@@ -711,7 +711,7 @@ class CustomNode:
 
   @classmethod
   def tree_unflatten(cls, aux_data, children):
-    return cls(children)
+    return cls(*children)
 
 @dataclass
 class CustomDataclass:
@@ -777,7 +777,7 @@ class UserAPITest(UserAPITestCase):
       return
 
     if use_node:
-      self.assertTrue(tree2[0].a == magic_value)
+      self.assertEqual(tree2[0].a, magic_value)
     if use_dataclass:
       self.assertEqual(tree2[1][0].a, magic_value)
       self.assertEqual(tree2[1][0].c, "hello")
@@ -793,10 +793,10 @@ class UserAPITest(UserAPITestCase):
     s = CustomStatic(magic_value - 1)
     tree_to_save = [n, (d, s)]
 
-    #if register:
-    #  jax.tree_util.register_dataclass(CustomDataclass, data_fields=["a", "d"], meta_fields=["c"])
-    #  jax.tree_util.register_pytree_node_class(CustomNode)
-    #  jax.tree_util.register_static(CustomStatic)
+    if register:
+      #jax.tree_util.register_dataclass(CustomDataclass, data_fields=["a", "d"], meta_fields=["c"])
+      jax.tree_util.register_pytree_node_class(CustomNode)
+      jax.tree_util.register_static(CustomStatic)
 
     save(tree_to_save, self.path, pickle_module=pickle)
     with self.assertRaises(ValueError):

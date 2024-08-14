@@ -323,7 +323,10 @@ async def async_load(directory: str | PathLike,
     "For checkpointing using remote URLs (e.g., gs, s3) you need `etils`"
     " module installed. You can install it using `pip install etils`.")
   root = Path(directory)
-  data_paths = [Path(path) for path in (root / _LEAF_DATA_DIR).iterdir()]
+  assert root.is_dir(), f"Checkpoint directory {root} does not exist"
+
+  data_paths = ([Path(path) for path in (root / _LEAF_DATA_DIR).iterdir()] 
+                if (root / _LEAF_DATA_DIR).exists() else [])
   
   # deserialize in 3 stages
 

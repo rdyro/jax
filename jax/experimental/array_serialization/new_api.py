@@ -46,6 +46,7 @@ _NODE_DATA_DIR = "node_data"
 _TREE_REPR_KEY = "__jax_tree_repr"
 _LEAF_IDS_KEY = "__jax_leaf_ids"
 _TYPE_ID_LEAF_DELIMITER = " -> "
+_USE_OCDBT = True
 
 __all__ = ["save", "load", "load_pytree", "async_save", 
            "async_load", "async_load_pytree"]
@@ -230,6 +231,7 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
                                 f" `{root}`, but you specified `{overwrite=}`")
 
   if not _is_remote_path(directory):
+    root = root.resolve()
     root.mkdir(exist_ok=True) # do not make parents, that's too much
     assert root.exists() and root.is_dir()
 
@@ -246,7 +248,7 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
     for leaf_id in leaf_ids_flat]
 
   (root / _PYTREEDEF_FILE).write_text(json.dumps(pytree_repr, indent=2))
-  paths = [root / _LEAF_DATA_DIR / f"{leaf_id}{_get_suffix(data)}"
+  paths = [(root / _LEAF_DATA_DIR / f"{leaf_id}{_get_suffix(data)}").resolve()
                    for leaf_id, data in zip(leaf_ids_flat, data_flat)]
 
   # start serialization ##################################
@@ -266,7 +268,8 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
   arr_flat = [data for path, data in zip(paths, data_flat) 
               if path.suffix == _TENSORSTORE_SUFFIX]
   arr_paths = [path for path in paths if path.suffix == _TENSORSTORE_SUFFIX]
-  ts_specs = [get_tensorstore_spec(path) for path in arr_paths]
+  ts_specs = [get_tensorstore_spec(path, ocdbt=_USE_OCDBT) 
+              for path in arr_paths]
   serialize_futures.extend([serialization.async_serialize(arr, ts_spec) 
                             for (arr, ts_spec) in zip(arr_flat, ts_specs)])
 
@@ -357,7 +360,8 @@ async def async_load(directory: str | PathLike,
   else:
     shardings = tree.flatten(shardings)[0]
 
-  ts_specs = [get_tensorstore_spec(path) for path in arr_paths]
+  ts_specs = [get_tensorstore_spec(path, ocdbt=_USE_OCDBT)
+              for path in arr_paths]
   arrs = {path.stem: serialization.async_deserialize(sharding, ts_spec) 
               for (sharding, ts_spec, path) 
               in zip(shardings, ts_specs, arr_paths)

@@ -41,6 +41,7 @@ from jax.experimental.array_serialization import serialization
 from jax.experimental.layout import Layout, DeviceLocalLayout as DLL
 
 from jax.experimental.array_serialization.new_api import load, save, load_pytree
+from jax.experimental.array_serialization import new_api
 
 import numpy as np
 import tensorstore as ts
@@ -106,40 +107,40 @@ class CheckpointTest(jtu.JaxTestCase):
     self.assertGreater(peak, 30_000_000)
     tm.stop()
 
-  #def test_memory_consumption_for_save(self):
-  #  global_mesh = jtu.create_global_mesh((1, 1), ('x', 'y'))
-  #  inp_shape = (16 * 1024, 16 * 1024)
-  #  pspec = P('x', 'y')
-  #  num = math.prod(inp_shape)
-  #  sharding = NamedSharding(global_mesh, pspec)
-  #  src = jnp.arange(num, dtype=np.int32).reshape(inp_shape)
-  #  inp = array.make_array_from_callback(
-  #      inp_shape, sharding, lambda idx: src[idx]
-  #  )
-  #  ckpt_dir = pathlib.Path(self.create_tempdir('memprofsave').full_path)
-  #  tspec = serialization.get_tensorstore_spec(str(ckpt_dir))
-  #  tspec['metadata'] = {
-  #      'shape': inp.shape,
-  #      'compressor': None,
-  #      'chunks': inp.shape,
-  #  }
+  def test_memory_consumption_for_save(self):
+    global_mesh = jtu.create_global_mesh((1, 1), ('x', 'y'))
+    inp_shape = (16 * 1024, 16 * 1024)
+    pspec = P('x', 'y')
+    num = math.prod(inp_shape)
+    sharding = NamedSharding(global_mesh, pspec)
+    src = jnp.arange(num, dtype=np.int32).reshape(inp_shape)
+    inp = array.make_array_from_callback(
+        inp_shape, sharding, lambda idx: src[idx]
+    )
+    ckpt_dir = pathlib.Path(self.create_tempdir('memprofsave').full_path)
+    tspec = serialization.get_tensorstore_spec(str(ckpt_dir))
+    tspec['metadata'] = {
+        'shape': inp.shape,
+        'compressor': None,
+        'chunks': inp.shape,
+    }
 
-  #  is_cpu = jtu.test_device_matches(['cpu'])
-  #  tm.start()
-  #  try:
-  #    manager = serialization.GlobalAsyncCheckpointManager()
-  #    manager.serialize(
-  #        [inp],
-  #        [tspec],
-  #        on_commit_callback=partial(
-  #            self._on_commit_callback, ckpt_dir, ckpt_dir
-  #        ),
-  #    )
-  #    manager.wait_until_finished()
-  #    unused_current, peak = tm.get_traced_memory()
-  #    self.assertLess(peak, src.nbytes * (1 * (not is_cpu) + 0.5))
-  #  finally:
-  #    tm.stop()
+    is_cpu = jtu.test_device_matches(['cpu'])
+    tm.start()
+    try:
+      manager = serialization.GlobalAsyncCheckpointManager()
+      manager.serialize(
+          [inp],
+          [tspec],
+          on_commit_callback=partial(
+              self._on_commit_callback, ckpt_dir, ckpt_dir
+          ),
+      )
+      manager.wait_until_finished()
+      unused_current, peak = tm.get_traced_memory()
+      self.assertLess(peak, src.nbytes * (1 * (not is_cpu) + 0.5))
+    finally:
+      tm.stop()
 
   def test_checkpointing_with_path_variant(self):
     global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
@@ -803,6 +804,24 @@ class UserAPITest(UserAPITestCase):
       tree2 = load(self.path, pickle_module=None)
     tree2 = load(self.path, pickle_module=None, best_effort=True)
     #self.assertFalse(str(tree2))
+
+  def test_flax_frozen_dict(self):
+    try:
+      from flax.core.frozen_dict import FrozenDict
+    except ImportError:
+      logging.warning("Skipping Flax FrozenDict tests as flax is not installed")
+      return
+      
+    save(FrozenDict(a=1, b=self.generate_clean_tree()), self.path)
+    load(self.path)
+    extended_node_types = new_api._EXTENDED_NODE_TYPES_MAP
+    with absltest.mock.patch(save.__module__ + "._EXTENDED_NODE_TYPES_MAP", {
+      **extended_node_types, **{"flax.core.frozen_dict.FrozenDict": 
+                                "nonexisting_module3434.FrozenDict"}}):
+      with self.assertRaises(RuntimeError):
+        load(self.path)
+      load(self.path, best_effort=True) 
+    load(self.path) 
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

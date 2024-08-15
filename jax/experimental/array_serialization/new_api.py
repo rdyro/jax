@@ -14,19 +14,19 @@
 
 from __future__ import annotations
 
+import collections
 from os import PathLike
-from typing import Any, Sequence, TypeVar
+from typing import Any, Sequence
 from uuid import uuid4
 import json
 import asyncio
-import time
 import threading
 import shutil
 import pickle
 import functools
+import time
 import logging
-from dataclasses import dataclass
-import inspect
+import importlib
 
 import jax
 from jax.tree_util import PyTreeDef, default_registry, treedef_is_leaf
@@ -196,6 +196,7 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
     NotImplementedError: If `overwrite` is False and a checkpoint already
       exists at the provided directory.
   """
+  #await asyncio.sleep(10)
 
   assert not _is_remote_path(directory) or epath_installed, (
     "For checkpointing using remote URLs (e.g., gs, s3) you need `etils`"
@@ -247,24 +248,31 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
     _join_leaf_type_and_id(leaf_ids_type_map[leaf_id], leaf_id) 
     for leaf_id in leaf_ids_flat]
 
-  (root / _PYTREEDEF_FILE).write_text(json.dumps(pytree_repr, indent=2))
-  paths = [(root / _LEAF_DATA_DIR / f"{leaf_id}{_get_suffix(data)}").resolve()
-                   for leaf_id, data in zip(leaf_ids_flat, data_flat)]
+  serialize_futures = []
 
   # start serialization ##################################
 
+  # 0. serialize the pytree
+  if not _is_remote_path(root) or jax.process_index() == 0:
+    serialize_futures.append(asyncio.to_thread(
+      lambda: (root / _PYTREEDEF_FILE).write_text(
+        json.dumps(pytree_repr, indent=2))))
+    paths = [(root / _LEAF_DATA_DIR / f"{leaf_id}{_get_suffix(data)}") 
+             for leaf_id, data in zip(leaf_ids_flat, data_flat)]
+
+
   # 1. serialize JSON serializable leafs
-  obj_flat = [data for path, data in zip(paths, data_flat) 
-              if path.suffix != _TENSORSTORE_SUFFIX]
-  obj_paths = [path for path in paths if path.suffix != _TENSORSTORE_SUFFIX]
   obj_serialize_futures = []
-  for data, path in zip(obj_flat, obj_paths):
-    # each host has to read all binary files
-    obj_serialize_futures.append(asyncio.to_thread(_obj_serialize, data, path, 
-                                                   pickle_module=pickle_module))
+  if not _is_remote_path(root) or jax.process_index() == 0:
+    obj_flat = [data for path, data in zip(paths, data_flat) 
+                if path.suffix != _TENSORSTORE_SUFFIX]
+    obj_paths = [path for path in paths if path.suffix != _TENSORSTORE_SUFFIX]
+    for data, path in zip(obj_flat, obj_paths):
+      # each host has to read all binary files
+      obj_serialize_futures.append(asyncio.to_thread(
+        _obj_serialize, data, path, pickle_module=pickle_module))
 
   # 2. serialize arrays
-  serialize_futures = []
   arr_flat = [data for path, data in zip(paths, data_flat) 
               if path.suffix == _TENSORSTORE_SUFFIX]
   arr_paths = [path for path in paths if path.suffix == _TENSORSTORE_SUFFIX]
@@ -274,7 +282,8 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
                             for (arr, ts_spec) in zip(arr_flat, ts_specs)])
 
   # 3. serialize node data if permissive
-  if pickle_module is not None:
+  if pickle_module is not None and (not _is_remote_path(root) or 
+                                    jax.process_index() == 0):
     for node_data_key, node_data_bytes in node_data_store.items():
       path = root / _NODE_DATA_DIR / f"{node_data_key}.pickle"
       serialize_futures.append(asyncio.to_thread(_obj_serialize, 
@@ -324,6 +333,8 @@ async def async_load(directory: str | PathLike,
     " module installed. You can install it using `pip install etils`.")
   root = Path(directory)
   assert root.is_dir(), f"Checkpoint directory {root} does not exist"
+  if not _is_remote_path(root):
+    root = root.resolve()
 
   data_paths = ([Path(path) for path in (root / _LEAF_DATA_DIR).iterdir()] 
                 if (root / _LEAF_DATA_DIR).exists() else [])
@@ -412,9 +423,9 @@ async def async_load_pytree(directory: str | PathLike,
     # the checkpoint is strict / not permissive
     return StrictPyTreeSerialization.deserialize_pytree(raw_tree)
 
-def _maybe_run_async_sync(async_fn):
+def _maybe_run_async_sync(name, async_fn):
   """Run async routine synchronously irrespective of the current environment."""
-  @functools.wraps(async_fn)
+
   def wrapped_fn(*args, **kw):
     retval, exception = [None], [None]
 
@@ -435,45 +446,86 @@ def _maybe_run_async_sync(async_fn):
     if exception[0] is not None:
       raise exception[0]
     return retval[0]
+    
+  functools.update_wrapper(wrapper=wrapped_fn, wrapped=async_fn)
+  wrapped_fn.__name__ = name
+  wrapped_fn.__qualname__ = name
   return wrapped_fn
 
-load_pytree = _maybe_run_async_sync(async_load_pytree)
-save = _maybe_run_async_sync(async_save)
-load = _maybe_run_async_sync(async_load)
+load_pytree = _maybe_run_async_sync("load_pytree", async_load_pytree)
+save = _maybe_run_async_sync("save", async_save)
+load = _maybe_run_async_sync("load", async_load)
   
 ################################################################################
 
-_BUILTINS_MAP = {
+
+def _cls2typerepr(cls):
+  return f"{cls.__module__}.{cls.__name__}"
+
+# extended node types map for pickle-free nodes
+# we limit ourselves here to an enumerate list for safety
+# users who have additional needs can always fall-back to pickle
+_EXTENDED_NODE_TYPES_MAP = {
   "builtins.dict": dict,
   "builtins.list": list,
   "builtins.tuple": tuple,
   "builtins.set": set,
+  _cls2typerepr(collections.OrderedDict): collections.OrderedDict,
+  "flax.core.frozen_dict.FrozenDict": "flax.core.frozen_dict.FrozenDict",
 }
-_BUILTINS_SET = set(_BUILTINS_MAP.values())
-
-def _cls2typerepr(cls):
-  return f"{cls.__module__}.{cls.__name__}"
   
 def _encode_node_data(node_data, node_data_store: dict[str, Any], 
                       pickle_module: PickleModule | None):
   if node_data is None:
     return "leaf", None
-  elif node_data[0] in _BUILTINS_SET:
+  elif _cls2typerepr(node_data[0]) in _EXTENDED_NODE_TYPES_MAP:
     return (_cls2typerepr(node_data[0]), node_data[1])
   else:
+    # the fallback case
     node_data_key = str(uuid4())
     if pickle_module is None:
       raise ValueError(
         f"Node data `{node_data}` is not serializable without a pickle_module.")
+    # we pickle node_data which includes **both** the class and data
     node_data_store[node_data_key] = pickle_module.dumps(node_data)
     return (_cls2typerepr(node_data[0]), node_data_key)
+    
+def _decode_extended_type(typerepr: str, node_data: Any, best_effort: bool):
+  """Given a type name like `flax.core.frozen_dict` try to return the class."""
+  module_name, cls_name = typerepr.rsplit(".", 1)
+  try:
+    missing_attribute = False
+    module = importlib.import_module(module_name)
+    if not hasattr(module, cls_name):
+      missing_attribute = True
+      raise ImportError
+    node_cls = getattr(module, cls_name)
+  except ImportError:
+    missing_mod_msg = f"Could not find module `{module_name}`."
+    missing_cls_msg = (f"Coud not find class `{cls_name}` in module"
+                        f" `{module_name}`.")
+    if best_effort:
+      msg = f" Falling back to a list of children since {best_effort=}."
+      logging.warning((missing_mod_msg if missing_attribute 
+                        else missing_cls_msg) + msg)
+      node_cls, node_data = (list, None)
+    else:
+      raise RuntimeError(missing_mod_msg if missing_attribute 
+                          else missing_cls_msg)
+  return node_cls, node_data
 
 def _decode_node_data(node_type, node_data, node_data_store: dict[str, Any], 
                       pickle_module: PickleModule, best_effort: bool):
   if node_type is None or node_type == "leaf":
     return None
-  elif node_type in _BUILTINS_MAP:
-    return (_BUILTINS_MAP[node_type], node_data)
+  elif node_type in _EXTENDED_NODE_TYPES_MAP:
+    node_class_or_str = _EXTENDED_NODE_TYPES_MAP[node_type]
+    if isinstance(node_class_or_str, type):
+      node_cls = node_class_or_str
+    else:
+      node_cls, node_data = _decode_extended_type(node_class_or_str, node_data, 
+                                                  best_effort)
+    return (node_cls, node_data)
   else:
     node_data_ref = node_data
     if not best_effort:

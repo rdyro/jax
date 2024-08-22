@@ -17,7 +17,7 @@ from __future__ import annotations
 import collections
 from os import PathLike
 from typing import Any, Sequence
-from uuid import uuid4
+from uuid import uuid4, UUID
 import json
 import asyncio
 import threading
@@ -27,11 +27,14 @@ import functools
 import time
 import logging
 import importlib
+import itertools
 
 import jax
 from jax.tree_util import PyTreeDef, default_registry, treedef_is_leaf
 from jax import tree
 from jax._src.util import safe_zip
+from jax._src import distributed
+from jax.experimental.multihost_utils import broadcast_one_to_all
 from jax.experimental.array_serialization import serialization
 from jax.experimental.array_serialization.serialization import get_tensorstore_spec
 from jax.experimental.array_serialization.serialization import _REMOTE_URL_PREFIXES
@@ -47,12 +50,33 @@ _TREE_REPR_KEY = "__jax_tree_repr"
 _LEAF_IDS_KEY = "__jax_leaf_ids"
 _TYPE_ID_LEAF_DELIMITER = " -> "
 _USE_OCDBT = True
+_SYNC_KEY_TIMEOUT_SEC = 300
 
 __all__ = ["save", "load", "load_pytree", "async_save", 
            "async_load", "async_load_pytree"]
 
 PyTreeT = Any
 PickleModule = pickle
+
+def _get_unique_sync_key() -> str | None:
+  """Generate a thread-local key for ensuring all host finish (de)serializing"""
+  if jax.process_count() == 1:
+    return None
+  # broadcast a thread-local unique barrier name
+  sync_key_id = UUID(bytes=np.array(broadcast_one_to_all(
+    np.frombuffer(uuid4().bytes, dtype=np.int32))).tobytes())
+  sync_key = f"jax_sync_key_{str(sync_key_id)}"
+  return sync_key
+
+
+def _sync_on_key(key: str | None) -> None:
+  if key is None:
+    return
+  assert jax.process_count() > 1, (
+    "You are attempting to wait for other hosts, but there is only 1 host"
+  )
+  distributed.global_state.client.wait_at_barrier(key, 
+                                                  _SYNC_KEY_TIMEOUT_SEC * 1000)
 
 def _is_array_like(x: Any):
   return isinstance(x, (jax.Array, np.ndarray))
@@ -196,7 +220,7 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
     NotImplementedError: If `overwrite` is False and a checkpoint already
       exists at the provided directory.
   """
-  #await asyncio.sleep(10)
+  sync_key = _get_unique_sync_key()  # get a synchronization key for multi-host
 
   assert not _is_remote_path(directory) or epath_installed, (
     "For checkpointing using remote URLs (e.g., gs, s3) you need `etils`"
@@ -204,10 +228,6 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
   )
   data_flat, pytreedef = tree.flatten(data)
   serialize_pytree = PermissivePyTreeSerialization.serialize_pytree
-  #if pickle_module is not None:
-  #  serialize_pytree = PermissivePyTreeSerialization.serialize_pytree
-  #else:
-  #  serialize_pytree = StrictPyTreeSerialization.serialize_pytree
 
   # overwrite or error
   root = Path(directory)
@@ -278,8 +298,11 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
   arr_paths = [path for path in paths if path.suffix == _TENSORSTORE_SUFFIX]
   ts_specs = [get_tensorstore_spec(path, ocdbt=_USE_OCDBT) 
               for path in arr_paths]
-  serialize_futures.extend([serialization.async_serialize(arr, ts_spec) 
-                            for (arr, ts_spec) in zip(arr_flat, ts_specs)])
+  # primary host set to host 0 or None (all hosts write everything)
+  primary_host = None if not _is_remote_path(directory) else jax.process_index()
+  serialize_futures.extend([serialization.async_serialize(
+    arr, ts_spec, primary_host=primary_host) 
+    for (arr, ts_spec) in zip(arr_flat, ts_specs)])
 
   # 3. serialize node data if permissive
   if pickle_module is not None and (not _is_remote_path(root) or 
@@ -303,10 +326,11 @@ async def async_save(data: PyTreeT, directory: str | PathLike,
                             p.rename(p.with_suffix(new_suffix)), 
                             path, obj_actual_suffix))
   await asyncio.gather(*rename_futures)
+  _sync_on_key(sync_key) # we are done with all async ops here, we can block
 
 
 async def async_load(directory: str | PathLike, 
-                     shardings: Sequence | None = None, 
+                     shardings: PyTreeT | None = None, 
                      pytree: PyTreeT | None = None,
                      pickle_module: PickleModule | None = None,
                      best_effort: bool = False) -> PyTreeT:
@@ -320,17 +344,22 @@ async def async_load(directory: str | PathLike,
       specify a pytree with string object ids. Useful for partial reads.
     pickle_module: Pickle module supporting dumps and loads methods.
     best_effort: Proceed with deserialization even in the face of partial 
-      failures.
+      failures. Return custom nodes as a list of children.
   Returns:
     Reconstructed data structure.
   Raises:
     AssertionError: If attempting to load from a remote path without etils
       installed.
     ValueError: If data for specific leaf IDs is missing in the directory.
+    ImportError: If supported node type (e.g., flax's FrozenDict) cannot be 
+      imported.
   """
   assert not _is_remote_path(directory) or epath_installed, (
     "For checkpointing using remote URLs (e.g., gs, s3) you need `etils`"
     " module installed. You can install it using `pip install etils`.")
+
+  sync_key = _get_unique_sync_key()  # get a synchronization key for multi-host
+
   root = Path(directory)
   assert root.is_dir(), f"Checkpoint directory {root} does not exist"
   if not _is_remote_path(root):
@@ -383,6 +412,7 @@ async def async_load(directory: str | PathLike,
   arr_and_objs = objs | arrs # pythonic join dictionaries 
   filled_values = await asyncio.gather(*[arr_and_objs[leaf_id] 
                                          for leaf_id in leaf_ids])
+  _sync_on_key(sync_key) # we are done with all async ops here, we can block
   return tree.unflatten(pytreedef, filled_values)
 
   
@@ -392,6 +422,9 @@ async def async_load_pytree(directory: str | PathLike,
   """Loads a pytree from the given directory.
   Args:
     directory: Directory path to load from.
+    pickle_module: Pickle module supporting dumps and loads methods.
+    best_effort: Proceed with deserialization even in the face of partial 
+      failures. Return custom nodes as a list of children.
   Returns:
     The loaded pytree.
   """
@@ -510,8 +543,8 @@ def _decode_extended_type(typerepr: str, node_data: Any, best_effort: bool):
                         else missing_cls_msg) + msg)
       node_cls, node_data = (list, None)
     else:
-      raise RuntimeError(missing_mod_msg if missing_attribute 
-                          else missing_cls_msg)
+      raise ImportError(missing_mod_msg if missing_attribute 
+                        else missing_cls_msg)
   return node_cls, node_data
 
 def _decode_node_data(node_type, node_data, node_data_store: dict[str, Any], 

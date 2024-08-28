@@ -2,13 +2,16 @@ import asyncio
 import threading
 
 import jax
-from jax._src.util import safe_zip
+import numpy as np
 
 from .new_api import PyTreeDef, PyTreeT, PathLike, PickleModule
 from .new_api import async_load, async_save  # async routines
 from .new_api import load_pytree  # synchronous routine for data overview
-from .new_api import PermissivePyTreeSerialization, _join_leaf_type_and_id
-from .new_api import _TREE_REPR_KEY, _LEAF_IDS_KEY, _leaf_to_type_desc
+from .new_api import PermissivePyTreeSerialization, Path
+from .new_api import _LEAF_DATA_DIR
+from .new_api import _TYPE_ID_LEAF_DELIMITER, _TENSORSTORE_SUFFIX
+
+__all__ = ["nonblocking_load", "nonblocking_save"]
 
 serialize_pytree = PermissivePyTreeSerialization.serialize_pytree
 
@@ -73,6 +76,46 @@ class SerializationFuture:
     """Wait for the underlying thread to complete."""
     return self._thread.join()
 
+def _construct_shape_dtype_pytree_from_leaf_ids(directory: str | PathLike, 
+                                                pytree: PyTreeT | None = None):
+  leaf_ids_flat, tree_struct = jax.tree_flatten(pytree)
+  node_data_dir = (Path(directory) / _LEAF_DATA_DIR)
+  assert node_data_dir.exists()
+  paths = list(node_data_dir.iterdir())
+  leaf_id2path = {path.stem: path for path in paths}
+  
+  print(leaf_ids_flat)
+
+  leaf_desc_flat = []
+  for leaf_id in leaf_ids_flat:
+    leaf_id: str
+    if _TYPE_ID_LEAF_DELIMITER in leaf_id:
+      leaf_type, leaf_id = leaf_id.split(_TYPE_ID_LEAF_DELIMITER, 1)
+    else:
+      leaf_type, leaf_id = "unknown", leaf_id
+    leaf_type = leaf_type.strip()
+    assert leaf_id in leaf_id2path
+    suffix = leaf_id2path[leaf_id].suffix
+    if suffix == _TENSORSTORE_SUFFIX:
+      # we're dealing with an array
+      leaf_type = leaf_type.strip()
+      # we're splitting a descriptor of the form `dtype[shape]`
+      # e.g., float32[14, 2]
+      dtype_str, shape_str = leaf_type.split("[", 1)
+      shape = [int(x.strip()) for x in shape_str.strip("]").strip().split(",") 
+               if len(x.strip()) > 0]
+      dtype = jax.numpy.dtype(dtype_str)
+      leaf_desc_flat.append(jax.ShapeDtypeStruct(shape, dtype))
+    else:
+      leaf_desc_flat.append(leaf_type) # TODO(rdyro): return actual type
+  return jax.tree_unflatten(tree_struct, leaf_desc_flat)
+
+    
+def _pytree_leaf_desc(leaf):
+  if isinstance(leaf, (np.ndarray, jax.Array)):
+    return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+  else:
+    return leaf
   
 def nonblocking_save(data: PyTreeT, directory: str | PathLike, 
                      overwrite: bool = True, 
@@ -82,16 +125,9 @@ def nonblocking_save(data: PyTreeT, directory: str | PathLike,
     fut = SerializationFuture(async_save, data, directory, overwrite, 
                               pickle_module)
     # construct a nice looking pytree representing the nodes being read
-    data_flat, pytreedef = jax.tree_util.tree_flatten(data)
-    node_repr, leaf_ids, node_data_store = serialize_pytree(
-      pytreedef, pickle_module)
-    leaf_ids_flat = node_repr[_LEAF_IDS_KEY]
-    inscribed_leafs_flat = {
-      _join_leaf_type_and_id(_leaf_to_type_desc(leaf), leaf_id) 
-      for (leaf_id, leaf) in safe_zip(leaf_ids_flat, data_flat)}
-    fut.pytree = jax.tree_unflatten(pytreedef, inscribed_leafs_flat)
-
+    fut.pytree = jax.tree_map(_pytree_leaf_desc, data)
     return fut
+    
                      
 def nonblocking_load(directory: str | PathLike, 
                      shardings: PyTreeT | None = None, 
@@ -99,9 +135,11 @@ def nonblocking_load(directory: str | PathLike,
                      pickle_module: PickleModule | None = None,
                      best_effort: bool = False) -> SerializationFuture:
 
-  if pytree is None:
-    pytree = load_pytree(directory, pickle_module, best_effort)
   fut = SerializationFuture(async_load, directory, shardings, pytree, 
                             pickle_module, best_effort)
-  fut.pytree = pytree
+  # the user provided a pytree, we'll use this
+  # TODO(rdyro): technically, the user is expected to provide a pytree of UUIDs
+  if pytree is None: 
+    pytree = load_pytree(directory, pickle_module, best_effort)
+  fut.pytree = _construct_shape_dtype_pytree_from_leaf_ids(directory, pytree)
   return fut

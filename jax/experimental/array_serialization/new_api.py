@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import collections
 from os import PathLike
-from typing import Any, Sequence
+from typing import Any, Sequence, TypeVar
 from uuid import uuid4, UUID
 import json
 import asyncio
@@ -56,7 +56,7 @@ __all__ = ["save", "load", "load_pytree", "async_save",
            "async_load", "async_load_pytree"]
 
 PyTreeT = Any
-PickleModule = pickle
+PickleModule = TypeVar("PickleModule")
 
 def _get_unique_sync_key() -> str | None:
   """Generate a thread-local key for ensuring all host finish (de)serializing"""
@@ -417,8 +417,8 @@ async def async_load(directory: str | PathLike,
 
   
 async def async_load_pytree(directory: str | PathLike, 
-                            pickle_module: PickleModule | None = None,
-                            best_effort: bool = False) -> PyTreeDef:
+                             pickle_module: PickleModule | None = None,
+                             best_effort: bool = False) -> PyTreeDef:
   """Loads a pytree from the given directory.
   Args:
     directory: Directory path to load from.
@@ -456,6 +456,7 @@ async def async_load_pytree(directory: str | PathLike,
     # the checkpoint is strict / not permissive
     return StrictPyTreeSerialization.deserialize_pytree(raw_tree)
 
+
 def _maybe_run_async_sync(name, async_fn):
   """Run async routine synchronously irrespective of the current environment."""
 
@@ -484,6 +485,8 @@ def _maybe_run_async_sync(name, async_fn):
   wrapped_fn.__name__ = name
   wrapped_fn.__qualname__ = name
   return wrapped_fn
+
+################################################################################
 
 load_pytree = _maybe_run_async_sync("load_pytree", async_load_pytree)
 save = _maybe_run_async_sync("save", async_save)

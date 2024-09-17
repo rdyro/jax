@@ -16,13 +16,14 @@
 from __future__ import annotations
 
 from functools import partial, lru_cache
-from typing import Optional
 import zlib
+import itertools
+import logging
 
 from typing import Any
 import jax
 import jax.numpy as jnp
-from jax.tree_util import tree_flatten, tree_map, tree_unflatten
+from jax.tree_util import tree_flatten, tree_unflatten
 from jax._src import core
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
@@ -33,9 +34,83 @@ from jax._src.interpreters import pxla
 from jax.interpreters import xla
 from jax._src import pjit as pjit_lib
 from jax.sharding import PartitionSpec as P
-from jax._src import distributed
+from jax._src import distributed, xla_bridge
 from jax._src.util import safe_zip
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+_TIMEOUT_MS = 300 * 1000
+_MULTIHOST_MONOTONIC_COUNTER = itertools.count()
+
+
+def _array_pytree_to_bytes(in_tree: Any) -> tuple[bytes, list[slice]]:
+  """Convert a pytree of jax arrays into a concatenate payload."""
+  assert jax.tree.reduce(
+    all, jax.tree.map(lambda x: x.is_fully_addressable, in_tree)), (
+      "All arrays that are broadcasted must be fully addressable")
+  payload_tree = jax.tree.map(lambda x: x.tobytes(), in_tree)
+  payload_flat = jax.tree.leaves(payload_tree)
+  payload_concat = b"".join(payload_flat)
+  splits = np.cumsum([0] + [len(x) for x in payload_flat])
+  splits = [slice(splits[i], splits[i+1]) for i in range(len(splits) - 1)]
+  return payload_concat, splits
+
+
+def _array_pytree_from_bytes(in_bytes: Any, shape_dtype_tree, splits):
+  """Using shape and dtype information, split buffers and convert to arrays."""
+  payload_flat = [in_bytes[split] for split in splits]
+  tree_struct = jax.tree.structure(shape_dtype_tree)
+  return jax.tree.map(
+    lambda x, y: np.frombuffer(x, dtype=y.dtype).reshape(y.shape),
+    jax.tree.unflatten(tree_struct, payload_flat), shape_dtype_tree)
+
+
+def _broadcast_one_to_all_cpu_fallback(in_tree,
+                                       is_source: bool | None = None) -> Any:
+  """Implement CPU broadcast fallback using XLA's bytes sharing."""
+  is_source = is_source if is_source is not None else jax.process_index() == 0
+  client = distributed.global_state.client
+  if client is None:
+    raise RuntimeError("jax.distributed is not initialized, cannot broadcast")
+  unique_multihost_key = (f"_jax_{_broadcast_one_to_all_cpu_fallback.__name__}"
+                          f"-{next(_MULTIHOST_MONOTONIC_COUNTER)}")
+  in_tree = jax.tree.map(jnp.asarray, in_tree)
+  shape_dtype_tree = jax.tree.map(
+    lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), in_tree)
+  payload, splits = _array_pytree_to_bytes(in_tree)
+  if is_source:
+    client.key_value_set_bytes(unique_multihost_key + "-bytes", payload,
+                               allow_overwrite=True)
+  client.wait_at_barrier(unique_multihost_key + "-barrier", _TIMEOUT_MS, None)
+  payload = client.blocking_key_value_get_bytes(unique_multihost_key + "-bytes",
+                                                _TIMEOUT_MS)
+  return _array_pytree_from_bytes(payload, shape_dtype_tree, splits)
+
+def _allgather_cpu_fallback(in_tree, tiled: bool = True) -> Any:
+  """Implement CPU broadcast fallback using XLA's bytes sharing."""
+  client = distributed.global_state.client
+  if client is None:
+    raise RuntimeError("jax.distributed is not initialized, cannot broadcast")
+  unique_multihost_key = (f"_jax_{_allgather_cpu_fallback.__name__}"
+                          f"-{next(_MULTIHOST_MONOTONIC_COUNTER)}")
+  in_tree = jax.tree.map(jnp.asarray, in_tree)
+  shape_dtype_tree = jax.tree.map(
+    lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), in_tree)
+  payload, splits = _array_pytree_to_bytes(in_tree)
+  client.key_value_set_bytes(
+    unique_multihost_key + f"-bytes-{jax.process_index()}", payload,
+    allow_overwrite=True)
+  client.wait_at_barrier(unique_multihost_key + "-barrier", _TIMEOUT_MS, None)
+  payloads = [client.blocking_key_value_get_bytes(
+    unique_multihost_key + f"-bytes-{i}", _TIMEOUT_MS)
+    for i in range(jax.process_count())]
+  trees = [_array_pytree_from_bytes(payload, shape_dtype_tree, splits)
+           for payload in payloads]
+  if tiled:
+    return jax.tree.map(lambda *args: jnp.stack(args, 0), *trees)
+  else:
+    return jax.tree.map(lambda *args: jnp.concatenate(args, 0), *trees)
 
 
 def _psum(x: Any) -> Any:
@@ -78,10 +153,14 @@ def broadcast_one_to_all(in_tree: Any, is_source: bool | None = None) -> Any:
   def post_jit(x):
     return np.asarray(x.addressable_data(0))
 
-  in_tree = jax.tree.map(pre_jit, in_tree)
-  out_tree = jax.jit(_psum, out_shardings=jax.sharding.NamedSharding(
-      global_mesh, P()))(in_tree)
-  return jax.tree.map(post_jit, out_tree)
+  original_in_tree = in_tree
+  try:
+    in_tree = jax.tree.map(pre_jit, in_tree)
+    out_tree = jax.jit(_psum, out_shardings=jax.sharding.NamedSharding(
+        global_mesh, P()))(in_tree)
+    return jax.tree.map(post_jit, out_tree)
+  except xla_bridge.xla_extension.XlaRuntimeError:
+    return _broadcast_one_to_all_cpu_fallback(original_in_tree, is_source)
 
 
 def sync_global_devices(name: str):
@@ -151,7 +230,10 @@ def process_allgather(in_tree: Any, tiled: bool = False) -> Any:
 
   def _pjit(inp):
     return _handle_array_process_allgather(inp, tiled)
-  return jax.tree.map(_pjit, in_tree)
+  try:
+    return jax.tree.map(_pjit, in_tree)
+  except xla_bridge.xla_extension.XlaRuntimeError:
+    return _allgather_cpu_fallback(in_tree, tiled=tiled)
 
 
 def assert_equal(in_tree, fail_message: str = ''):

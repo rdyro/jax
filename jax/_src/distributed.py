@@ -17,7 +17,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 import logging
 import os
-from typing import Any
 
 from jax._src import clusters
 from jax._src import config
@@ -30,9 +29,9 @@ logger = logging.getLogger(__name__)
 class State:
   process_id: int = 0
   num_processes: int = 1
-  service: Any | None = None
-  client: Any | None = None
-  preemption_sync_manager: Any | None = None
+  service: xla_extension.DistributedRuntimeService| None = None
+  client: xla_extension.DistributedRuntimeClient | None = None
+  preemption_sync_manager: xla_extension.PreemptionSyncManager| None = None
   coordinator_address: str | None = None
 
   def initialize(self,

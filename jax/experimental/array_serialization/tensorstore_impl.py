@@ -77,6 +77,10 @@ class _LimitInFlightBytes:
       assert self._available_bytes <= self._max_bytes
       self._cv.notify_all()
 
+def is_tensorstore_spec_leaf(leaf: Any):
+  # TODO(rdyro): think of a better way to detect which leaf is a ts config
+  return isinstance(leaf, dict) and "driver" in leaf or "kvstore" in leaf
+
 def _prime_factors(x: int) -> list[int]:
   # find prime factors of axis sizes to help efficiently find divisor chunks
   factors = []
@@ -162,6 +166,46 @@ def _get_tensorstore_metadata_cached(
             'chunks': np.array(np.maximum(1, local_shape)).tolist()}
   else:
     raise ValueError(f"Unsupported driver: {driver}")
+
+_divides = lambda x, y: np.all((np.array(x) % np.array(y)) == 0)
+
+def merge_nested_specs(dict1: dict[Any, Any], dict2: dict[Any, Any]):
+  """Merge two specs as nested dictionaries, dict2 takes precedence."""
+  if dict2 is None:
+    return dict1
+  exclusive_dict1_keys = set(dict1.keys()) - set(dict2.keys())
+  exclusive_dict2_keys = set(dict2.keys()) - set(dict1.keys())
+  shared_keys = set(dict1.keys()) & set(dict2.keys())
+  out_dict = {k: dict1[k] for k in exclusive_dict1_keys}
+  out_dict.update({k: dict2[k] for k in exclusive_dict2_keys})
+  for k in shared_keys:
+    v1, v2 = dict1[k], dict2[k]
+    if isinstance(v1, dict):
+      out_dict[k] = merge_nested_specs(v1, v2)
+    else:
+      out_dict[k] = v2
+  return out_dict
+
+def verify_tensorstore_spec(spec: dict[str, Any], arr: jax.Array | None,
+                            path: str | os.PathLike[str],
+                            check_metadata: bool = True) -> None:
+  """Verify the minimum requirements for a tensorstore spec."""
+  if check_metadata:
+    assert arr is not None, "Array is required for metadata verification."
+    metadata = spec['metadata']
+    msg = f"Provided dtype {metadata['data_type']} != array dtype: {arr.dtype}"
+    assert metadata['data_type'] == jnp.dtype(arr.dtype).name, msg
+    msg = f"Provided shape {metadata['shape']} != array shape: {arr.shape}"
+    assert metadata['shape'] == arr.shape, msg
+    local_shape = arr.addressable_data(0).shape
+    chunk_shape = metadata['chunk_grid']['configuration']['chunk_shape']
+    msg = (f"Provided chunk shape {chunk_shape} does not divide the local shape"
+           f" of the array {local_shape}")
+    assert _divides(local_shape, chunk_shape), msg
+  # we don't support altering the path of the tensorstore
+  msg = (f"Provided { path = } does not match the path in the spec:"
+         f" {spec['kvstore']}")
+  assert spec["kvstore"]['base']['path'] == str(path), msg
 
 def _spec_has_metadata(tree):
   if not isinstance(tree, dict):
@@ -277,6 +321,21 @@ async def _transfer_shard_to_host(shard: array.Shard) -> np.ndarray:
   # implicitly converts the written data to a numpy array, and would otherwise
   # silently copy host-to-host.
   return np.array(data, copy=False)
+
+async def combine_kvstores(combined_kvstore: dict[str, Any],
+                           kvstores: list[dict[str, Any]],
+                           context: ts.Context | dict[str, Any] = _TS_CONTEXT
+                           ) -> None:
+  """Merge a list of kvstores into a single kvstore. NOT multi-process safe."""
+  combined_fut = ts.KvStore.open(combined_kvstore, context=context)
+  kvstores_futs = [ts.KvStore.open(kvstore, context=context)
+                   for kvstore in kvstores]
+  combined, kvstores = await asyncio.gather(combined_fut,
+                                            asyncio.gather(*kvstores_futs))
+  tx = ts.Transaction()
+  await asyncio.gather(*[kvstore.experimental_copy_range_to(
+      combined.with_transaction(tx)) for kvstore in kvstores])
+  await tx.commit_async()
 
 async def async_serialize(
     arr_inp,

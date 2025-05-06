@@ -1,4 +1,4 @@
-# Copyright 2021 The JAX Authors.
+# Copyright 2025 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,15 +49,11 @@ _REMOTE_URL_PREFIXES = ['gs://', 's3://']
 _PYTREEDEF_FILE = "pytreedef.json"
 _TENSORSTORE_SUFFIX = ".tensorstore"
 _ARCHIVE_NAME = "archive.zip"
-_TYPE_LEAF_DELIM = " -> "
 _USE_OCDBT = True  # a lot of the code relies on this being True
 _MAX_PATH_LENGTH = 4096
 _ARRAY_STORE_DIRNAME = f"array_store{_TENSORSTORE_SUFFIX}"
-#_ARRAY_TYPE_NAME = "Array"
-#_ARRAY_TYPE_REGEX = r"Array\[\[([0-9, ]*)\],\s*([a-zA-Z0-9_]+)\]"
-_ARRAY_TYPE_FORMAT = "Array({}[{}])"
-_ARRAY_TYPE_REGEX = r"Array\(" + r"([a-zA-Z0-9_]+)" + r"\[([0-9, ]*)\]" + r"\)"
-_DOT_REPLACEMENT = ":"
+_ARRAY_TYPE_FORMAT = "Array({dtype}[{shape}])"
+_ARRAY_TYPE_REGEX = r"Array\(([a-zA-Z0-9_]+)\[([0-9, ]*)\]\)"
 _MAX_CONCURRENCY = 32
 
 __all__ = ["save", "load", "load_pytreedef", "nonblocking_load",
@@ -98,56 +94,37 @@ def _sync_on_key(key: str | None, extra_tag: str = "") -> None:
 def _is_array_like(x):
   return isinstance(x, (jax.Array, np.ndarray))
 
-def _leaf_to_type_desc(leaf) -> str:
+def _leaf_to_desc(leaf) -> str:
   if leaf is None:
     return "null"
   elif isinstance(leaf, (np.ndarray, jax.Array)):
-    return _ARRAY_TYPE_FORMAT.format(leaf.dtype.name, 
-                                     ", ".join(map(str, leaf.shape)))
+    return _ARRAY_TYPE_FORMAT.format(
+        dtype=leaf.dtype.name, shape=", ".join(map(str, leaf.shape)))
   else:
     return type(leaf).__name__
 
-def _leaf_desc_to_leaf(leaf_desc: str) -> str | jax.ShapeDtypeStruct:
-  leaf_type: str = (leaf_desc.split(_TYPE_LEAF_DELIM, 1)[0]
-                    if _TYPE_LEAF_DELIM in leaf_desc else leaf_desc)
-  shape_dtype_match = re.match(_ARRAY_TYPE_REGEX, leaf_type)
-  if shape_dtype_match is None:
-    return leaf_type
+def _desc_to_leaf(leaf_desc: str) -> str | jax.ShapeDtypeStruct:
+  if not re.match(_ARRAY_TYPE_REGEX, leaf_desc):
+    return leaf_desc
+  shape_dtype_match = re.match(_ARRAY_TYPE_REGEX, leaf_desc)
   assert shape_dtype_match is not None, (
-      f"Failed to parse array descriptor: {leaf_type} with pattern:"
+      f"Failed to parse array descriptor: {leaf_desc} with pattern:"
       f" {_ARRAY_TYPE_REGEX}")
   dtype_str, shape_str = shape_dtype_match.groups()
   shape = [int(x.strip()) for x in shape_str.strip("]").strip().split(",")
             if len(x.strip()) > 0]
-  dtype = jax.numpy.dtype(dtype_str)
-  return jax.ShapeDtypeStruct(shape, dtype)
-
-def _inscribe_leaf_types(pytree_repr: dict[str, Any],
-                         leaf_id_type_map: dict[str, str]):
-  """Rewrite a JSON PyTree representation by adding type to leaf_id."""
-  if pytree_repr["node_type"] == "leaf":
-    leaf_id = pytree_repr["leaf_id"]
-    if leaf_id is None:
-      return
-    pytree_repr["leaf_id"] = (f"{leaf_id_type_map[leaf_id]}"
-                              f"{_TYPE_LEAF_DELIM}{leaf_id}")
-  else:
-    _ = [_inscribe_leaf_types(child, leaf_id_type_map)
-         for child in pytree_repr["children"]]
-
-def _inplace_add_types_to_pytree_repr(pytree_repr, leaf_ids_flat, data_flat):
-  # inscribe types into leaf ids in-place
-  leaf_id2type = {leaf_id: _leaf_to_type_desc(leaf) for (leaf_id, leaf)
-                  in zip(leaf_ids_flat, data_flat)}
-  pytree_repr[utils._LEAF_IDS_KEY] = [
-      f"{leaf_id2type[leaf_id]}{_TYPE_LEAF_DELIM}{leaf_id}"
-      for leaf_id in leaf_ids_flat]
+  return jax.ShapeDtypeStruct(shape, jax.numpy.dtype(dtype_str))
 
 def _is_remote_path(path: str | PathLike[str]):
   """Check whether a path is remote by examining the prefix."""
   # we need to truncate e.g., gs:// to gs:/ because pathlib.Path collapses //
   return any(str(path).startswith(prefix[:-1])
              for prefix in _REMOTE_URL_PREFIXES)
+
+def _norm_path(path: str | PathLike[str]) -> Path:
+  if _is_remote_path(path):
+    return Path(path)
+  return Path(path).expanduser().resolve()
 
 def _rm_dir(root: Path) -> None:  # pytype: disable=invalid-annotation
   if _is_remote_path(root):
@@ -160,15 +137,14 @@ def _set_up_destination(root: Path, overwrite: bool,  # pytype: disable=invalid-
                         distinct_locations: bool, sync_key: str | None
                         ) -> dict[str, Any]:
   """Inspect the destination, set it up for writing, potentially read existing data."""
-  root = Path(root)
+  root = _norm_path(root)
   if overwrite:
     if root.exists() and len(list(root.iterdir())) > 0:
       # check that we're only deleting things that come from JAX
       # refuse to rm directories containing additional entries
-      paths_present = list(root.iterdir())
-      extra_member_paths = [path for path in paths_present if path.name not in
-                            (_PYTREEDEF_FILE, _ARCHIVE_NAME,
-                             _ARRAY_STORE_DIRNAME)]
+      extra_member_paths = [
+          path for path in list(root.iterdir()) if path.name not in
+          (_PYTREEDEF_FILE, _ARCHIVE_NAME, _ARRAY_STORE_DIRNAME)]
 
       assert len(extra_member_paths) == 0, (
         "Refusing to work on a directory that is not a previous checkpoint."
@@ -185,46 +161,64 @@ def _set_up_destination(root: Path, overwrite: bool,  # pytype: disable=invalid-
                        f" specified `{overwrite=}`")
     return pytree_repr
 
-def _prepare_directory(directory: Path, overwrite: bool,  # pytype: disable=invalid-annotation
+def _prepare_directory(root: Path, overwrite: bool,  # pytype: disable=invalid-annotation
                        pytreedef_repr: dict[str, Any],
                        distinct_locations: bool, sync_key: str | None):
   """Prepare the directory: check destination, potentially read existing data
   and overwrite.
   """
-  directory = Path(directory)
+  root = _norm_path(root)
   # prepare the destination directory, overwrite destination directory or error
-  root = Path(directory).resolve()
-  pytreedef_repr = _set_up_destination(root, overwrite,
-                                       pytreedef_repr, distinct_locations,
-                                       sync_key)
+  pytreedef_repr = _set_up_destination(
+      root, overwrite, pytreedef_repr, distinct_locations, sync_key)
 
-  if not _is_remote_path(directory):
+  if not _is_remote_path(root):
     if distinct_locations or jax.process_index() == 0:
       root.mkdir(exist_ok=True)  # do not make parents, that's too much
-      assert root.exists() and root.is_dir()
-
+      if not root.exists() or not root.is_dir():
+        raise RuntimeError(f"Could not create destination directory at {root}")
   _sync_on_key(sync_key, "mkdir")
   return pytreedef_repr
 
-async def serialize_array(arr, path, extra_config, distinct_locations: bool
+async def _serialize_array(arr, path, extra_config, distinct_locations: bool
                           ) -> None:
   arr = jax.numpy.asarray(arr, dtype=arr.dtype)
   extra_ts_spec = extra_config
-  process_num = (jax.process_index() if (
+  process_idx = (jax.process_index() if (
       jax.process_count() > 1 and not distinct_locations) else None)
 
   default_ts_spec = ts_impl.get_tensorstore_spec(
-      path, ocdbt=_USE_OCDBT, process_num=process_num, arr=arr)
+      path, ocdbt=_USE_OCDBT, process_idx=process_idx, arr=arr)
   ts_spec = ts_impl.merge_nested_specs(default_ts_spec, extra_ts_spec)
 
   # verify the merged spec
-  expected_path = default_ts_spec['kvstore']['base']['path']
+  expected_path = default_ts_spec["kvstore"]["base"]["path"]
   ts_impl.verify_tensorstore_spec(ts_spec, arr, expected_path,
                                   check_metadata=True)
 
   # all hosts write because they're writing to different storage locations (to
   # be combined later) -> `primary_host=None`
   await ts_impl.async_serialize(arr, ts_spec, primary_host=None)
+
+def _write_pytreedef(directory: Path, pytree_repr: dict[str, Any],  # pytype: disable=invalid-annotation
+                     distinct_locations: bool):
+  """Write the pytreedef to the desitination directory and aux data to the archive."""
+  if not (jax.process_index() == 0 or distinct_locations):
+    return
+  root = _norm_path(directory)
+  (root / _PYTREEDEF_FILE).write_text(json.dumps(pytree_repr, indent=2))
+
+def _write_arrays(arrs_and_paths: list[tuple[Any, Path]],  # pytype: disable=invalid-annotation
+                  full_ts_specs: list[Any | None],
+                  distinct_locations: bool):
+
+  async def _serialize_arrays():
+    await asyncio.gather(*[_serialize_array(
+      arr, path, extra_ts_spec, distinct_locations)
+      for ((arr, path), extra_ts_spec)
+      in zip(arrs_and_paths, full_ts_specs)])
+
+  asyncio.run(_serialize_arrays())
 
 def _finalize_array_store(kvstore_path, extra_config, distinct_locations: bool
                          ) -> None:
@@ -237,51 +231,15 @@ def _finalize_array_store(kvstore_path, extra_config, distinct_locations: bool
   extra_ts_spec = extra_config
   dummy_key_path = os.path.join(kvstore_path, "dummy_key")
   combined_ts_spec = ts_impl.merge_nested_specs(ts_impl.get_tensorstore_spec(
-      dummy_key_path, ocdbt=_USE_OCDBT, process_num=None), extra_ts_spec)
+      dummy_key_path, ocdbt=_USE_OCDBT, process_idx=None), extra_ts_spec)
   children_ts_spec = [ts_impl.merge_nested_specs(ts_impl.get_tensorstore_spec(
-      dummy_key_path, ocdbt=_USE_OCDBT, process_num=i), extra_ts_spec)
+      dummy_key_path, ocdbt=_USE_OCDBT, process_idx=i), extra_ts_spec)
       for i in range(jax.process_count())]
   combined_kvstore = combined_ts_spec["kvstore"]
   children_kvstores = [ts_spec["kvstore"] for ts_spec in children_ts_spec]
   _ = combined_kvstore.pop("path")
   _ = [kvstore.pop("path") for kvstore in children_kvstores]
   asyncio.run(ts_impl.combine_kvstores(combined_kvstore, children_kvstores))
-
-async def deserialize_array(
-    path: str | PathLike[str], sharding: jax.sharding.Sharding | Layout,
-    ts_spec: dict[str, Any],
-    byte_limiter: ts_impl._LimitInFlightBytes | None = None) -> jax.Array:
-  """Deserialize an array from a given path with an optional extra tensorstore spec."""
-  # every process reads from the central location
-  default_ts_spec = ts_impl.get_tensorstore_spec(
-      path, ocdbt=_USE_OCDBT, process_num=None)
-  expected_path = default_ts_spec['kvstore']['base']['path']
-  ts_spec = ts_impl.merge_nested_specs(default_ts_spec, ts_spec)
-  ts_impl.verify_tensorstore_spec(ts_spec, arr=None, path=expected_path,
-                                  check_metadata=False)
-  return await ts_impl.async_deserialize(sharding, ts_spec,
-                                         byte_limiter=byte_limiter)
-
-def _write_pytreedef(directory: Path, pytree_repr: dict[str, Any],  # pytype: disable=invalid-annotation
-                     distinct_locations: bool):
-  """Write the pytreedef to the desitination directory and aux data to the archive."""
-  if not (jax.process_index() == 0 or distinct_locations):
-    return
-  root = Path(directory)
-  pytree_repr_json = json.dumps(pytree_repr, indent=2)
-  (root / _PYTREEDEF_FILE).write_text(pytree_repr_json)
-
-def _write_arrays(arrs_and_paths: list[tuple[Any, Path]],  # pytype: disable=invalid-annotation
-                  full_ts_specs: list[Any | None],
-                  distinct_locations: bool):
-
-  async def _serialize_arrays():
-    await asyncio.gather(*[serialize_array(
-      arr, path, extra_ts_spec, distinct_locations)
-      for ((arr, path), extra_ts_spec)
-      in zip(arrs_and_paths, full_ts_specs)])
-
-  asyncio.run(_serialize_arrays())
 
 def save(data: PyTreeT, directory: str | PathLike[str], overwrite: bool = True,
          ts_specs: PyTreeT | None = None) -> None:
@@ -324,16 +282,15 @@ def _save(data: PyTreeT, directory: str | PathLike[str], overwrite: bool = True,
     logger.warning("Saving to different locations on different hosts is"
                    " supported, but extremely fragile. Consider using a single"
                    " location.")
-  root = Path(directory).resolve()
+  root = _norm_path(directory)
 
   # start serialization ##################################
   futures, executor = [], ThreadPoolExecutor(max_workers=_MAX_CONCURRENCY)
 
-  # serialize the pytree
+  # serialize the pytree #################################
   pytreedef_repr = utils.serialize_pytreedef(pytreedef)
+  pytreedef_repr[utils._LEAF_IDS_KEY] = jax.tree.map(_leaf_to_desc, data_flat)
   leaf_ids_flat = list(range(len(pytreedef_repr[utils._LEAF_IDS_KEY])))
-  # augment the pytree representation with leaf types
-  _inplace_add_types_to_pytree_repr(pytreedef_repr, leaf_ids_flat, data_flat)
 
   pytreedef_repr = _prepare_directory(root, overwrite,
                                       pytreedef_repr, distinct_locations,
@@ -341,7 +298,7 @@ def _save(data: PyTreeT, directory: str | PathLike[str], overwrite: bool = True,
   futures.append(executor.submit(_write_pytreedef, root, pytreedef_repr,
                                   distinct_locations))
 
-  # serialize arrays
+  # serialize arrays #####################################
   array_store_path = root / _ARRAY_STORE_DIRNAME
   arrs_and_paths = [(data, array_store_path / str(leaf_id)) for data, leaf_id in
                     zip(data_flat, leaf_ids_flat)]
@@ -350,24 +307,39 @@ def _save(data: PyTreeT, directory: str | PathLike[str], overwrite: bool = True,
   futures.append(executor.submit(_write_arrays, arrs_and_paths, full_ts_specs,
                                  distinct_locations))
 
-  # wait for all futures to complete
+  # wait for all futures to complete #####################
   _ = [fut.result() for fut in futures]
   _sync_on_key(sync_key, "array_serialization")
   if len(arrs_and_paths) > 0:
     _finalize_array_store(array_store_path, full_ts_specs[0],
                           distinct_locations)
-  # we are done with all async ops here, we can block
+  # we are done with all async ops here, we can block ####
   _sync_on_key(sync_key, "end")
+
+async def _deserialize_array(
+    path: str | PathLike[str], sharding: jax.sharding.Sharding | Layout,
+    ts_spec: dict[str, Any],
+    byte_limiter: ts_impl._LimitInFlightBytes | None = None) -> jax.Array:
+  """Deserialize an array from a given path with an optional extra tensorstore spec."""
+  # every process reads from the central location
+  default_ts_spec = ts_impl.get_tensorstore_spec(
+      path, ocdbt=_USE_OCDBT, process_idx=None)
+  expected_path = default_ts_spec['kvstore']['base']['path']
+  ts_spec = ts_impl.merge_nested_specs(default_ts_spec, ts_spec)
+  ts_impl.verify_tensorstore_spec(ts_spec, arr=None, path=expected_path,
+                                  check_metadata=False)
+  return await ts_impl.async_deserialize(sharding, ts_spec,
+                                         byte_limiter=byte_limiter)
 
 def _read_arrays(array_store_path: Path, arr_leaf_ids: list[int],  # pytype: disable=invalid-annotation
                  ts_specs: Any | None,
                  shardings: PyTreeT | utils._MISSING_TYPE):
   # array_store_path = root / _LEAF_DATA_DIR / _ARRAY_STORE_DIRNAME
-  arr_store_path = Path(array_store_path)
+  arr_store_path = _norm_path(array_store_path)
   arr_paths = [arr_store_path / str(leaf_id) for leaf_id in arr_leaf_ids]
   # missing sharding assumes we want to deserialize on default device
   if shardings is utils.MISSING:
-    device = jax.local_devices()[0]  # default device
+    device = jax.devices()[0]  # default device
     shardings = [SingleDeviceSharding(device) for _ in arr_paths]
   else:
     shardings = jax.tree.flatten(shardings, is_leaf=lambda x: x is None)[0]
@@ -376,23 +348,40 @@ def _read_arrays(array_store_path: Path, arr_leaf_ids: list[int],  # pytype: dis
   full_ts_specs = (([None] * len(arr_paths))
                    if ts_specs is None else jax.tree.leaves(
                        ts_specs, is_leaf=ts_impl.is_tensorstore_spec_leaf))
-  byte_limiter = ts_impl._LimitInFlightBytes(100 * 1024 ** 3)  # 100 GB
+  # byte limiter to limit number of parallel reads, resizes to largest read
+  byte_limiter = ts_impl._LimitInFlightBytes(10 * 1024 ** 3)  # 10 GB
+
   async def _deserialize_arrays():
     return await asyncio.gather(*[
-        deserialize_array(path, sharding, ts_spec, byte_limiter)
+        _deserialize_array(path, sharding, ts_spec, byte_limiter)
         for (path, sharding, ts_spec)
         in zip(arr_paths, shardings, full_ts_specs)])
 
   arr_keys = [int(path.stem) for path in arr_paths]
 
   # finally, collect the results
-  arrs = dict(zip(arr_keys, asyncio.run(_deserialize_arrays())))
-  return arrs
+  return dict(zip(arr_keys, asyncio.run(_deserialize_arrays())))
 
+def load_pytreedef(directory: str | PathLike[str]) -> PyTreeDef:
+  """Loads a pytree from the given directory.
+  Args:
+    directory: Directory path to load from.
+  Returns:
+    The loaded pytree with arrays represented as jax.ShapeDtypeStruct's.
+  """
+  assert not _is_remote_path(directory) or epath_installed, (
+    "For checkpointing using remote URLs (e.g., gs, s3) you need `etils`"
+    " module installed. You can install it using `pip install etils`.")
+  json_content = (_norm_path(directory) / _PYTREEDEF_FILE).read_text()
+  raw_tree = json.loads(json_content)
+  leaves = map(_desc_to_leaf, raw_tree[utils._LEAF_IDS_KEY])
+  return jax.tree.unflatten(utils.deserialize_pytreedef(raw_tree), leaves)
+
+_prefix_mask = lambda m, x: jax.tree.map(lambda _: None, x) if not m else x
 
 def load(directory: str | PathLike[str],
          shardings: PyTreeT | utils._MISSING_TYPE = utils.MISSING,
-         pytree: PyTreeT | utils._MISSING_TYPE = utils.MISSING,
+         mask: PyTreeT | utils._MISSING_TYPE = utils.MISSING,
          ts_specs: PyTreeT | None = None) -> PyTreeT:
   """Loads and reconstructs a data structure from a directory.
 
@@ -400,8 +389,6 @@ def load(directory: str | PathLike[str],
     directory: Directory path where the data is stored.
     shardings: Sharding strategy for array objects. If None, defaults to
       single device sharding on the default device.
-    pytree: Optional pre-populated PyTree for structure. If provided, must
-      specify a pytree with string object ids. Useful for partial reads.
   Returns:
     Reconstructed data structure.
 
@@ -414,59 +401,26 @@ def load(directory: str | PathLike[str],
     "For checkpointing using remote URLs (e.g., gs, s3) you need `etils`"
     " module installed. You can install it using `pip install etils`.")
 
-  root = Path(directory).resolve()
+  root = _norm_path(directory)
   assert root.is_dir(), f"Checkpoint directory {root} does not exist"
-  if not _is_remote_path(root):
-    root = root.resolve()
 
   # deserialize PyTreeDef
-  if pytree is utils.MISSING:
-    pytree = load_pytreedef(directory)
-    pytreedef = jax.tree.structure(pytree, is_leaf=lambda x: x is None)
-    raw_pytreedef_repr = json.loads((root / _PYTREEDEF_FILE).read_text())
-    leaf_ids_flat = raw_pytreedef_repr[utils._LEAF_IDS_KEY]
-    # in pytreedef, None leafs indicate StaticNodes (without leaves)
-    # so we CANNOT flatten with is_leaf=lambda x: x is None
-  else:
-    leaf_ids_flat, pytreedef = jax.tree.flatten(pytree,
-                                                is_leaf=lambda x: x is None)
+  pytree = load_pytreedef(directory)
+  if mask is not utils.MISSING:
+    pytree = jax.tree.map(_prefix_mask, mask, pytree)
+  pytreedef = jax.tree.structure(pytree, is_leaf=lambda x: x is None)
+  leaf_ids_flat = jax.tree.leaves(pytree, is_leaf=lambda x: x is None)
   executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENCY)
-
+    
   # deserialize array objects
-  arr_leaf_ids = [i for i, leaf_id in enumerate(leaf_ids_flat) 
-                  if leaf_id is not None
-                  and ((hasattr(leaf_id, "shape") and hasattr(leaf_id, "dtype"))
-                       or re.match(_ARRAY_TYPE_REGEX, leaf_id))]
+  arr_leaf_ids = [i for i, leaf_id in enumerate(leaf_ids_flat)
+                  if leaf_id is not None]
   arrs_fut = executor.submit(_read_arrays, root / _ARRAY_STORE_DIRNAME,
-                            arr_leaf_ids, ts_specs, shardings)
+                             arr_leaf_ids, ts_specs, shardings)
 
   arrs = arrs_fut.result()
-  filled_values = [arrs.get(leaf_id, None)
-                   for leaf_id in range(len(leaf_ids_flat))]
+  filled_values = [arrs.get(i, None) for i, _ in enumerate(leaf_ids_flat)]
   return jax.tree.unflatten(pytreedef, filled_values)
-
-def load_pytreedef(directory: str | PathLike[str]) -> PyTreeDef:
-  """Loads a pytree from the given directory.
-  Args:
-    directory: Directory path to load from.
-  Returns:
-    The loaded pytree.
-  """
-  assert not _is_remote_path(directory) or epath_installed, (
-    "For checkpointing using remote URLs (e.g., gs, s3) you need `etils`"
-    " module installed. You can install it using `pip install etils`.")
-  root = Path(directory).resolve()
-  json_content = (root / _PYTREEDEF_FILE).read_text()
-  raw_tree = json.loads(json_content)
-  leaves = [_leaf_desc_to_leaf(leaf) for leaf in raw_tree[utils._LEAF_IDS_KEY]]
-  return jax.tree.unflatten(utils.deserialize_pytreedef(raw_tree), leaves)
-
-
-def _pytree_leaf_desc(leaf):
-  if isinstance(leaf, (np.ndarray, jax.Array)):
-    return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
-  else:
-    return leaf
 
 nonblocking_executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENCY)
 
@@ -479,20 +433,16 @@ def nonblocking_save(data: PyTreeT, directory: str | PathLike[str],
 
   .. code-block:: python
     fut = nonblocking_save(data, directory)
-    print(fut.pytree)  # a pytree of jax.ShapeDtypeStruct
+    print(fut.pytree)  # a pytree of jax.ShapeDtypeStruct's
     print(fut.result())  # None, blocking until the serialization is done
   """
   # start serialization immediately
   fut = utils.AwaitableFuture(nonblocking_executor.submit(
       save, data, directory, overwrite, tensorstore_specs))
   # construct a nice looking pytree representing the nodes being read
-  fut.pytree = jax.tree.map(_pytree_leaf_desc, data)
+  fut.pytree = jax.tree.map(lambda leaf:jax.typeof(leaf)
+                            if _is_array_like(leaf) else leaf, data)
   return fut
-
-
-_is_desc_array = lambda x: (
-    re.match(_ARRAY_TYPE_REGEX, x.split(_TYPE_LEAF_DELIM, 1)[0]) is not None)
-_none_is_leaf = lambda x: x is None
 
 def nonblocking_load(directory: str | PathLike[str],
                      shardings: PyTreeT | utils._MISSING_TYPE = utils.MISSING,
@@ -510,16 +460,11 @@ def nonblocking_load(directory: str | PathLike[str],
   if pytreedef is utils.MISSING:
     pytreedef = load_pytreedef(directory)
 
-  # read in all the objects synchronously, but arrays asynchronously
-  arr_pytree = jax.tree.map(lambda x: x if _is_desc_array(x) else None,
-                            pytreedef)
-  arr_shapes = jax.tree.map(_leaf_desc_to_leaf, arr_pytree)  # skip None-s here
-  pytree_stub = arr_shapes
-
   # TODO(rdyro): the awaitable future output is a workaround
   # it should return the fully populated pytree instead of just
   # jax.ShapeDtypeStruct for arrays by constructing them asynchronously
   fut = utils.AwaitableFuture(nonblocking_executor.submit(
       load, directory, shardings, pytreedef, tensorstore_specs))
-  fut.pytree = pytree_stub
+  fut.pytree = jax.tree.map(lambda leaf:jax.typeof(leaf)
+                            if _is_array_like(leaf) else leaf, pytreedef)
   return fut

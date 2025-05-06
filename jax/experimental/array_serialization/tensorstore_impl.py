@@ -233,7 +233,7 @@ def _get_kvstore_for_s3(ckpt_path: str):
 
 def get_tensorstore_spec(
     ckpt_path: str | PathLike[str], ocdbt: bool = True,
-    process_num: int | None = None, arr: jax.Array | None = None,
+    process_idx: int | None = None, arr: jax.Array | None = None,
     driver: str = _TS_ARRAY_DRIVER) -> dict[str, Any]:
 
   # Normalize path to exclude trailing '/'. In GCS path case, normpath will
@@ -245,9 +245,9 @@ def get_tensorstore_spec(
   # in cases of multi-process writes, we need to write to a different location
   # for each process and finally created a combined symlink to the final
   # location, tensorstore can do this via ts.KvStore.experimental_copy_range_to
-  if process_num is not None:
+  if process_idx is not None:
     _parent, _name = os.path.split(ckpt_path)
-    ckpt_path = os.path.join(_parent, _PROCESS_DIR_FORMAT.format(process_num),
+    ckpt_path = os.path.join(_parent, _PROCESS_DIR_FORMAT.format(process_idx),
                              _name)
 
   is_gcs_path = ckpt_path.startswith('gs://')

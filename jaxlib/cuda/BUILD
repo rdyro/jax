@@ -474,6 +474,7 @@ cc_library(
         ":cusolver_kernels_ffi",
         ":cusparse_kernels",
         ":triton_kernels",
+        "//jaxlib/mosaic/gpu:mosaic_gpu_support",
         "@xla//xla/ffi/api:c_api",
         "@xla//xla/ffi/api:ffi",
         "@xla//xla/service:custom_call_target_registry",
@@ -639,6 +640,7 @@ cc_library(
         "@xla//third_party/python_runtime:headers",  # buildcleaner: keep
         "@xla//xla:comparison_util",
         "@xla//xla:shape_util",
+        "@xla//xla:util",
         "@xla//xla:xla_data_proto_cc",
         "@xla//xla/ffi:ffi_api",
         "@xla//xla/ffi/api:ffi",

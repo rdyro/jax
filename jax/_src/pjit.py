@@ -80,6 +80,8 @@ from jax._src.util import (
     HashableFunction, safe_map, safe_zip, wraps, tuple_insert,
     distributed_debug_log, split_list, split_list_checked, weakref_lru_cache,
     merge_lists, subs_list, fun_name, fun_qual_name)
+from jax._src.attrs import (Box, List, dne_sentinel, jax_setattr, jax_getattr,
+                            jax_extendattr)
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -578,8 +580,11 @@ def _infer_params_impl(
   del args
   f, dyn_kwargs = argnames_partial_except(f, ji.static_argnames, kwargs)
   del kwargs
+
   dyn_args, dyn_kwargs, box_data = _flatten_boxes(dbg, dyn_args, dyn_kwargs)
-  f = _handle_boxes(f, dbg)
+  if box_data:
+    f = _handle_boxes(f, dbg)
+
   explicit_args, in_tree = tree_flatten((dyn_args, dyn_kwargs))
   flat_fun, out_tree = flatten_fun(f, in_tree)
   flat_fun, explicit_args = hoist_obj_attrs(flat_fun, explicit_args)
@@ -720,7 +725,6 @@ def _infer_params_internal(
       static_argnames=ji.static_argnames, sourceinfo=ji.fun_sourceinfo,
       signature=ji.fun_signature)
 
-  from jax.experimental.attrs import Box, List
   any_boxes = any(isinstance(x, (Box, List)) for x in tree_leaves((args, kwargs)))
   if config.dynamic_shapes.value or any_boxes:  # don't use the cache
     p, args_flat = _infer_params_impl(fun, ji, ctx_mesh, dbg,
@@ -1414,7 +1418,7 @@ def explain_tracing_cache_miss(
     for d in smallest_diffs:
       p_one_diff(d)
 
-  return done()
+  done()
 
 
 @partial(lu.cache, explain=explain_tracing_cache_miss)
@@ -1504,7 +1508,6 @@ def _attr_cache_index(
     fun: lu.WrappedFun,
     in_type: core.InputType | tuple[core.AbstractValue, ...]
 ) -> int:
-  from jax.experimental.attrs import dne_sentinel
   cases = seen_attrs_get(fun, in_type)
   for i, records in enumerate(cases):
     for obj, attr, kind, treedef, avals in records:
@@ -1518,7 +1521,6 @@ def _attr_cache_index(
   return len(cases)
 
 def _attr_cachedata_update(fun, in_type, i, attrs_tracked):
-  from jax.experimental.attrs import dne_sentinel
   leaves = lambda obj, attr: tree_leaves(getattr(obj, attr, dne_sentinel))
   records = [(obj, attr, kind, init_tree, map(core.typeof, leaves(obj, attr)))
              for init_tree, _, (obj, attr, kind) in attrs_tracked]
@@ -1953,7 +1955,7 @@ def pjit_staging_rule(trace, *args, **params):
     assert next(out_tracers_, None) is None
   elif any(isinstance(c, core.MutableArray) for c in jaxpr.consts):
     jaxpr, consts = pxla._move_mutable_consts(jaxpr)
-    consts = map(partial(trace.new_const, source_info=source_info), consts)
+    consts = [trace.new_const(c, source_info) for c in consts]
     in_shardings = (*params['in_shardings'],) + (UNSPECIFIED,) * len(consts)
     in_layouts = (*params['in_layouts'],) + (None,) * len(consts)
     donated_invars = (*params['donated_invars'],) + (False,) * len(consts)
@@ -1973,8 +1975,8 @@ def _pjit_forwarding(jaxpr, out_shardings, out_layouts):
             for fwd, os, ol in zip(in_fwd, out_shardings, out_layouts)]
   keep = [f is None for f in in_fwd]
   jaxpr = pe.prune_closed_jaxpr_outputs(jaxpr, keep)
-  out_shardings = [o for o, k in zip(out_shardings, keep) if k]
-  out_layouts   = [o for o, k in zip(out_layouts  , keep) if k]
+  out_shardings = tuple(o for o, k in zip(out_shardings, keep) if k)
+  out_layouts   = tuple(o for o, k in zip(out_layouts  , keep) if k)
   return jaxpr, in_fwd, out_shardings, out_layouts
 
 def pjit_forwarding_rule(eqn):
@@ -1983,11 +1985,10 @@ def pjit_forwarding_rule(eqn):
   jaxpr, in_fwd, out_shardings, out_layouts = _pjit_forwarding(
       eqn.params['jaxpr'], eqn.params['out_shardings'], eqn.params['out_layouts'])
   new_outvars = [v for v, f in zip(eqn.outvars, in_fwd) if f is None]
-  new_params = dict(eqn.params, jaxpr=jaxpr, out_shardings=(*out_shardings,),
-                    out_layouts=(*out_layouts,))
+  new_params = dict(eqn.params, jaxpr=jaxpr, out_shardings=out_shardings,
+                    out_layouts=out_layouts)
   new_eqn = eqn.replace(params=new_params, outvars=new_outvars)
-  fwd_vars = [eqn.invars[f] if f is not None else None for f in in_fwd]
-  return fwd_vars, new_eqn
+  return in_fwd, new_eqn
 # TODO(mattjj): Remove pjit_forwarding_rule and also in staging rule.
 pe.forwarding_rules[pjit_p] = pjit_forwarding_rule
 
@@ -2819,20 +2820,22 @@ ad.deflinear2(sharding_constraint_p,
 
 def _sharding_constraint_hlo_lowering(ctx, x_node, *, sharding, layout,
                                       context_mesh, unconstrained_dims):
-  aval, = ctx.avals_in
+  in_aval, = ctx.avals_in
   out_aval, = ctx.avals_out
   axis_ctx = ctx.module_context.axis_context
+  if dtypes.issubdtype(in_aval.dtype, dtypes.extended):
+    in_aval = core.physical_aval(in_aval)
   if (isinstance(axis_ctx, sharding_impls.SPMDAxisContext) and
       axis_ctx.manual_axes):
-    sharding = mlir.add_manual_axes(axis_ctx, sharding, aval.ndim)
+    sharding = mlir.add_manual_axes(axis_ctx, sharding, in_aval.ndim)
   if config.use_shardy_partitioner.value:
-    sharding = sharding._to_sdy_sharding(aval.ndim)
+    sharding = sharding._to_sdy_sharding(in_aval.ndim)
   else:
-    sharding = sharding._to_xla_hlo_sharding(aval.ndim).to_proto()
+    sharding = sharding._to_xla_hlo_sharding(in_aval.ndim).to_proto()
   out = mlir.wrap_with_sharding_op(
       ctx, x_node, out_aval, sharding, unspecified_dims=unconstrained_dims)
   if layout is not None:
-    out = mlir.wrap_with_layout_op(ctx, out, out_aval, layout, aval)
+    out = mlir.wrap_with_layout_op(ctx, out, out_aval, layout, in_aval)
   return [out]
 mlir.register_lowering(sharding_constraint_p,
                        _sharding_constraint_hlo_lowering)
@@ -3172,7 +3175,6 @@ def get_unconstrained_dims(sharding: NamedSharding):
 # -------------------- attrs etc --------------------
 
 def _set_states(attrs_tracked, vals):
-  from jax.experimental.attrs import jax_setattr, jax_extendattr
   valss = split_list(vals, [td.num_leaves for _, td, _ in attrs_tracked[:-1]])
   for ((_, treedef, (obj, attr, kind)), leaves) in zip(attrs_tracked, valss):
     if kind is pe.ReadWrite:
@@ -3192,7 +3194,6 @@ def _set_states(attrs_tracked, vals):
       assert False
 
 def _get_states(attrs_tracked):
-  from jax.experimental.attrs import jax_getattr, dne_sentinel
   vals = []
   for treedef, _, (obj, attr, kind) in attrs_tracked:
     if kind is pe.ReadWrite:
@@ -3229,7 +3230,9 @@ class ListTree:
   treedef: PyTreeDef | None = static()
 
 def _flatten_boxes(dbg, args, kwargs):
-  from jax.experimental.attrs import Box, List
+  # TODO(mattjj,dougalm): refine this implementation of box-handling...
+  if all(not isinstance(x, (Box, List)) for x in tree_leaves((args, kwargs))):
+    return args, kwargs, []
   box_data = []
   id_first_occurrences = {}
   idxs = itertools.count()
@@ -3258,9 +3261,12 @@ def _flatten_boxes(dbg, args, kwargs):
   args, kwargs = tree_map(visit, (args, kwargs))
   return args, kwargs, box_data
 
+# TODO(mattjj): because _handle_boxes's caller passes arguments splatted, the
+# names of its first two parameters must not collide with user-suppliedkwargs.
+# Using obscure names is a temporary workaround; revise!
 @lu.transformation2
-def _handle_boxes(f, dbg, *args, **kwargs):
-  from jax.experimental.attrs import Box, List
+def _handle_boxes(__f, __dbg, *args, **kwargs):
+  f, dbg = __f, __dbg
   new_args = []
   arg_mutables = []
   def visit(x):

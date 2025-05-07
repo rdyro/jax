@@ -4934,6 +4934,38 @@ class ArrayPjitTest(jtu.JaxTestCase):
     else:
       self.assertIn("unspecified_dims=[0]", lowered_text)
 
+  def test_prng_key_wsc(self):
+    mesh = jtu.create_mesh((2,), 'x')
+
+    @jax.jit
+    def f(x):
+      y = lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
+      return y.T
+    f(jax.random.key(0))  # doesn't crash
+
+    @jax.jit
+    def g(x):
+      return lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
+    g(jax.random.key(1))  # doesn't crash
+
+  def test_prng_key_wsc_multi_axes_sharding(self):
+    input_shape = (8, 4)
+    mesh = jtu.create_mesh((4, 2), ('x', 'y'))
+    spec = P('x', 'y')
+
+    seeds, _ = create_array(input_shape, mesh, spec, dtype=np.uint32)
+
+    @jax.jit
+    def make_keys(seeds):
+      make_key = partial(prng.random_seed, impl=prng.threefry_prng_impl)
+      return lax.with_sharding_constraint(
+          make_key(seeds), NamedSharding(mesh, P('x', 'y')))
+
+    out = make_keys(seeds)
+    self.assertTrue(jax.dtypes.issubdtype(out.dtype, jax.dtypes.prng_key))
+    self.assertEqual(out.shape, input_shape)
+    jax.random.key_data(out)  # doesn't crash
+
 
 def spec_regex(s):
   return str(s).replace(r"(", r"\(").replace(r")", r"\)")
@@ -5118,7 +5150,7 @@ class ShardingInTypesTest(jtu.JaxTestCase):
       self.assertEqual(out[1].sharding, arr2.sharding)
 
       jaxpr = jitted_grad.trace(arr1, arr2).jaxpr
-      bwd_jaxpr = jaxpr.eqns[1]
+      bwd_jaxpr = jaxpr.eqns[-1]
       expected_spec = [('broadcast_in_dim', P('x', None)),
                       ('dot_general', P('x', None)),
                       ('transpose', P(None, 'x')),
@@ -7635,6 +7667,18 @@ class ShardingInTypesTest(jtu.JaxTestCase):
     out = f(arr)
     self.assertEqual(out.sharding, NamedSharding(mesh, P('x')))
     self.assertArraysEqual(out, np.ravel(np_inp))
+
+  @jtu.with_explicit_mesh((4, 2), ('x', 'y'))
+  def test_broadcast_forwarding(self, mesh):
+    arr = jax.device_put(np.zeros(()), P())
+
+    def f(x):
+      out = jax.lax.full_like(x, 1.0)
+      self.assertEqual(jax.typeof(out).sharding, jax.typeof(x).sharding)
+      return out
+
+    f(arr)
+    jax.jit(f)(arr)
 
 
 @jtu.pytest_mark_if_available('multiaccelerator')

@@ -245,6 +245,33 @@ def TPU_VectorStoreOp :TPU_Op<"vector_store", [DefaultMemWrite, AttrSizedOperand
   let hasVerifier = 1;
 }
 
+// tpu.vector_load loads a vector from memory into a register.
+//
+//  base   : Memref to load from.
+//  indices: Scalar indices into base. indices must be of the same rank as the
+//           base memref shape.
+//  strides: The stride to use for calculating the address of subsequent
+//           elements. If left unspecified, the stride is implicitly 1 along
+//           each dimension. Otherwise the stride must match the rank of the
+//           memref shape.
+//  mask   : Elementwise vector mask. Must be broadcastable to the shape of the
+//           result vector. Depending on the core type, this may be a dynamic
+//           (lane) mask consumed from a register or a static (sublane) mask
+//           that must be the result of arith.constant.
+def TPU_VectorLoadOp :TPU_Op<"vector_load", [DefaultMemRead, AttrSizedOperandSegments]> {
+  let arguments = (ins
+    AnyMemRef:$base,
+    Variadic<Index>:$indices,
+    DenseI32ArrayAttr:$strides,
+    Optional<AnyVectorOfNonZeroRank>:$mask   // Elementwise mask.
+  );
+  let results = (outs AnyVectorOfNonZeroRank:$result);
+  let assemblyFormat = [{
+    $base `[` $indices `]` (`masked` $mask^)? attr-dict `:` type($base) `,` type($result) `,` type($mask)
+  }];
+  let hasVerifier = 1;
+}
+
 def TPU_StridedLoadOp : TPU_Op<"strided_load", [DefaultMemRead]> {
   let arguments = (ins
     AnyMemRef:$base,
@@ -848,6 +875,38 @@ def TPU_PRNGSeed32Op : TPU_Op<"prng_set_seed_32"> {
 def TPU_PRNGRandomBitsOp : TPU_Op<"prng_random_bits"> {
   let arguments = (ins);
   let results = (outs AnyVectorOfNonZeroRank:$output);
+}
+
+def TPU_SublaneShuffleOp : TPU_Op<"sublane_shuffle", [SameOperandsAndResultType]> {
+  // This op takes 2 physical vregs and a pattern, applies the pattern,
+  // and returns the result as 1 vreg.
+  //
+  // The pattern is a list of integers, where the integer value is the
+  // index of the sublane in the *combined input* [lhs, rhs], and the
+  // position of the integer in the list is the index of the sublane
+  // in the *output* vreg.
+  //
+  // The pattern size must match the operand/result sublane count.
+  //
+  // Example:
+  //   %0 = tpu.single_output_sublane_shuffle %a, %b,
+  //        [0, 1, 2, 3, 4, 5, 6, 7] // Result is %a
+  //   %1 = tpu.single_output_sublane_shuffle %a, %b,
+  //        [8, 9, 10, 11, 12, 13, 14, 15] // Result is %b
+  //   %2 = tpu.single_output_sublane_shuffle %a, %b,
+  //        [7, 6, 5, 4, 11, 10, 9, 8] // Result uses high half of a
+  //                                  // and low half of b, reversed.
+  let arguments = (ins
+    TPU_Vreg:$lhs,
+    TPU_Vreg:$rhs,
+    DenseI32ArrayAttr:$pattern
+  );
+  let results = (outs TPU_Vreg:$result);
+  let assemblyFormat = [{
+    $lhs `,` $rhs `,` $pattern attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
 }
 
 def TPU_LogOp : TPU_Op<"log"> {

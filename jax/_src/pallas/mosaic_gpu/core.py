@@ -44,6 +44,7 @@ import jax.numpy as jnp
 from jaxlib.mlir import ir
 
 
+_Ref = pallas_core.AbstractMemoryRef | state_types.TransformedRef
 AbstractMemoryRef = pallas_core.AbstractMemoryRef
 
 DimensionSemantics = Literal["parallel", "sequential"]
@@ -144,7 +145,7 @@ class SemaphoreType(enum.Enum):
   def get_array_aval(self) -> jax_core.ShapedArray:
     return self(()).get_array_aval()
 
-  def get_ref_aval(self) -> pallas_core.TransformedRef | AbstractMemoryRef:
+  def get_ref_aval(self) -> _Ref:
     return self(()).get_ref_aval()
 
 
@@ -207,6 +208,10 @@ def _is_known_divisible(value, divisor, fuel=10) -> bool:
     case arith_dialect.MulIOp():
       return (_is_known_divisible(value.owner.operands[0], divisor, fuel // 2) or
               _is_known_divisible(value.owner.operands[1], divisor, (fuel + 1)// 2))
+    case arith_dialect.SelectOp():
+      return (_is_known_divisible(value.owner.operands[1], divisor, fuel // 2) and
+              _is_known_divisible(value.owner.operands[2], divisor, (fuel + 1)// 2))
+
   return False
 
 
@@ -214,7 +219,7 @@ def _is_known_divisible(value, divisor, fuel=10) -> bool:
 class GPUMemoryRef(pallas_core.MemoryRef):
   transforms: Sequence[MemoryRefTransform] = ()
 
-  def get_ref_aval(self) -> pallas_core.TransformedRef | AbstractMemoryRef:
+  def get_ref_aval(self) -> _Ref:
     aval = jax_core.ShapedArray(self.shape, self.dtype)
     for t in self.transforms:
       aval = t(aval)
@@ -258,9 +263,7 @@ def _ref_group_size(refs: _GPUMemoryRefTree) -> int:
   return size
 
 
-def flatten_ref_union(
-    ref_union: AbstractRefUnion,
-) -> tuple[pallas_core.AbstractMemoryRef | state_types.TransformedRef, ...]:
+def flatten_ref_union(ref_union: AbstractRefUnion) -> tuple[_Ref, ...]:
   """Flattens a union of trees of references into a tuple of references.
 
   This is the moral equivalent of `jax.tree.leaves` for aliased references.
@@ -563,6 +566,46 @@ class TransposeRef(state_types.Transform):
     return pp.text(f"{{transpose({list(self.permutation)})}}")
 
 
+@tree_util.register_pytree_node_class
+@dataclasses.dataclass
+class PeerMemRef(state_types.Transform):
+  device_id: Any
+  device_id_type: pallas_primitives.DeviceIdType
+
+  def transform_shape(self, shape):
+    return shape
+
+  def transform_dtype(self, dtype):
+    return dtype
+
+  def untransform_index(
+      self, idxs: tuple[Index, ...]
+  ) -> tuple[tuple[Index, ...], state_types.Transform]:
+    return idxs, self
+
+  def tree_flatten(self):
+    return (self.device_id,), (self.device_id_type,)
+
+  @classmethod
+  def tree_unflatten(cls, metadata, arrays):
+    return cls(arrays[0], metadata[0])
+
+
+def remote_ref(
+    ref: _Ref,
+    device_id: jax.typing.ArrayLike,
+    device_id_type: pallas_primitives.DeviceIdType = pallas_primitives.DeviceIdType.MESH,
+) -> pallas_core.TransformedRef:
+  """Translate memref to a symmetric memref on a peer device."""
+  if not isinstance(ref, pallas_core.TransformedRef):
+    if not isinstance(jax_core.get_aval(ref), pallas_core.AbstractMemoryRef):
+      raise TypeError("ref must be a reference")
+    ref = pallas_core.TransformedRef(ref, transforms=())
+  return pallas_core.TransformedRef(
+      ref.ref, (*ref.transforms, PeerMemRef(device_id, device_id_type)),
+  )
+
+
 def transform_ref(
     ref: pallas_core.TransformedRef,
     transform: state_types.Transform
@@ -761,6 +804,7 @@ class BarrierType(dtypes.ExtendedDType):
   name: ClassVar[str] = "barrier"
 
   num_arrivals: int
+  for_tensor_core: bool
 
   def __str__(self):
     return self.name
@@ -779,12 +823,24 @@ class ClusterBarrierType(dtypes.ExtendedDType):
 
 @dataclasses.dataclass(frozen=True)
 class Barrier:
+  """Describes a barrier Ref.
+
+  Attributes:
+    num_arrivals: The number of arrivals that will be recorded by this barrier.
+    num_barriers: The number of barriers that will be created. Individual
+      barriers can be accessed by indexing into the barrier Ref.
+    for_tensor_core: Whether this barrier is used for synchronizing with
+      the tensor core. This should be set to True when waiting on Blackwell
+      (TC Gen 5) asynchoronous matmul instructions.
+  """
   num_arrivals: int
   num_barriers: int = 1
+  for_tensor_core: bool = dataclasses.field(default=False, kw_only=True)
 
   def get_ref_aval(self) -> AbstractMemoryRef:
     aval = jax_core.ShapedArray(
-        [self.num_barriers], BarrierType(self.num_arrivals)
+        [self.num_barriers], BarrierType(self.num_arrivals,
+                                         for_tensor_core=self.for_tensor_core)
     )
     return AbstractMemoryRef(aval, SMEM)
 

@@ -191,9 +191,7 @@ nb::list PyClient::LiveExecutables() {
   nb::ft_lock_guard lock(executables_mutex_);
   nb::list executables;
   for (PyLoadedExecutable* exec = executables_; exec; exec = exec->next_) {
-    if (!exec->is_deleted()) {
-      executables.append(nb::find(exec));
-    }
+    executables.append(nb::find(exec));
   }
   return executables;
 }
@@ -446,7 +444,7 @@ PyClient::CompileIfrtProgram(
     }
   }
 
-  std::unique_ptr<ifrt::LoadedExecutable> ifrt_loaded_executable;
+  ifrt::LoadedExecutableRef ifrt_loaded_executable;
   std::optional<std::string> fingerprint;
   {
     nb::gil_scoped_release gil_release;
@@ -529,7 +527,7 @@ PyClient::DeserializeExecutable(nb_class_ptr<PyClient> client,
                                 ifrt::DeviceListRef executable_devices,
                                 std::optional<CompileOptions> options,
                                 std::vector<nb::capsule> host_callbacks) {
-  std::unique_ptr<ifrt::LoadedExecutable> ifrt_loaded_executable;
+  ifrt::LoadedExecutableRef ifrt_loaded_executable;
   std::optional<std::string> fingerprint;
   auto ifrt_deserialize_options = MakeIfrtDeserializeExecutableOptions(
       std::move(options), std::move(executable_devices),
@@ -621,12 +619,10 @@ absl::StatusOr<nb::bytes> PyClient::HeapProfile() {
 
   for (PyLoadedExecutable* executable = executables_; executable;
        executable = executable->next_) {
-    if (!executable->is_deleted()) {
-      HeapProfileKey key{
-          executable->traceback() ? executable->traceback()->get() : nullptr,
-          executable->SizeOfGeneratedCodeInBytes(), nullptr};
-      ++entries[key];
-    }
+    HeapProfileKey key{
+        executable->traceback() ? executable->traceback()->get() : nullptr,
+        executable->SizeOfGeneratedCodeInBytes(), nullptr};
+    ++entries[key];
   }
 
   PprofProfileBuilder builder;

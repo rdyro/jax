@@ -737,6 +737,10 @@ jax_multiplatform_test(
         "gpu_p100x2_shardy",
         "gpu_p100x2_pjrt_c_api",
     ],
+    shard_count = {
+        "cpu": 10,
+        "gpu": 10,
+    },
     tags = [
         "multiaccelerator",
     ],
@@ -1589,6 +1593,10 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "export_back_compat_test",
     srcs = ["export_back_compat_test.py"],
+    # TODO(b/415285434): enable once we have backwards compatibility support with GSPMD checkpoints.
+    # enable_configs = [
+    #     "tpu_v3_x4_shardy",
+    # ],
     tags = [],
     deps = [
         "//jax:internal_export_back_compat_test_data",

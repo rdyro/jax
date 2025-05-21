@@ -79,7 +79,8 @@ class _LimitInFlightBytes:
 
 def is_tensorstore_spec_leaf(leaf: Any):
   # TODO(rdyro): think of a better way to detect which leaf is a ts config
-  return isinstance(leaf, dict) and "driver" in leaf or "kvstore" in leaf
+  return leaf is None or (isinstance(leaf, dict)
+                          and ("driver" in leaf or "kvstore" in leaf))
 
 def _prime_factors(x: int) -> list[int]:
   # find prime factors of axis sizes to help efficiently find divisor chunks
@@ -169,43 +170,51 @@ def _get_tensorstore_metadata_cached(
 
 _divides = lambda x, y: np.all((np.array(x) % np.array(y)) == 0)
 
-def merge_nested_specs(dict1: dict[Any, Any], dict2: dict[Any, Any]):
-  """Merge two specs as nested dictionaries, dict2 takes precedence."""
-  if dict2 is None:
+def merge_nested_ts_specs(dict1: dict[Any, Any], dict2: dict[Any, Any] | None):
+  """Merge two ts specs, dict2 takes precedence."""
+  if dict2 is None:  # nothing to do
     return dict1
-  exclusive_dict1_keys = set(dict1.keys()) - set(dict2.keys())
-  exclusive_dict2_keys = set(dict2.keys()) - set(dict1.keys())
-  shared_keys = set(dict1.keys()) & set(dict2.keys())
-  out_dict = {k: dict1[k] for k in exclusive_dict1_keys}
-  out_dict.update({k: dict2[k] for k in exclusive_dict2_keys})
-  for k in shared_keys:
-    v1, v2 = dict1[k], dict2[k]
-    if isinstance(v1, dict):
-      out_dict[k] = merge_nested_specs(v1, v2)
-    else:
-      out_dict[k] = v2
-  return out_dict
+  # TODO(rdyro): this is an opinionated merge, we should get user feedback
+  # merge kvstore explicitly
+  kvstore = dict1.get("kvstore", {}) | dict2.get("kvstore", {})
+  return dict1 | dict(dict2, kvstore=kvstore)  # merge with dict2 preferred
 
 def verify_tensorstore_spec(spec: dict[str, Any], arr: jax.Array | None,
-                            path: str | os.PathLike[str],
+                            path: str | os.PathLike[str], ocdbt: bool,
                             check_metadata: bool = True) -> None:
   """Verify the minimum requirements for a tensorstore spec."""
+  if ocdbt:
+    if spec.get("kvstore", {}).get("driver", "") != "ocdbt":
+      raise ValueError(f"Expected ocdbt driver, got {spec=}")
   if check_metadata:
-    assert arr is not None, "Array is required for metadata verification."
+    if arr is None:
+      raise ValueError("Array is required for metadata verification.")
     metadata = spec['metadata']
-    msg = f"Provided dtype {metadata['data_type']} != array dtype: {arr.dtype}"
-    assert metadata['data_type'] == jnp.dtype(arr.dtype).name, msg
-    msg = f"Provided shape {metadata['shape']} != array shape: {arr.shape}"
-    assert metadata['shape'] == arr.shape, msg
-    local_shape = arr.addressable_data(0).shape
-    chunk_shape = metadata['chunk_grid']['configuration']['chunk_shape']
-    msg = (f"Provided chunk shape {chunk_shape} does not divide the local shape"
-           f" of the array {local_shape}")
-    assert _divides(local_shape, chunk_shape), msg
-  # we don't support altering the path of the tensorstore
-  msg = (f"Provided { path = } does not match the path in the spec:"
-         f" {spec['kvstore']}")
-  assert spec["kvstore"]['base']['path'] == str(path), msg
+    if spec.get("driver", "") == "zarr3":
+      if metadata['data_type'] != jnp.dtype(arr.dtype).name:
+        raise ValueError(f"Provided dtype ({metadata['data_type']=}) doesn't"
+                         f" match ({arr.dtype=})")
+    if 'shape' in metadata:
+      if metadata['shape'] != arr.shape:
+        raise ValueError(f"Provided shape ({metadata['shape']=}) doesn't match"
+                         f" ({arr.shape=})")
+    if hasattr(arr, 'addressable_data'):
+      local_shape = arr.addressable_data(0).shape
+    else:  # np.ndarray
+      local_shape = arr.shape
+    if spec.get("driver", "") == "zarr3":
+      chunk_shape = metadata['chunk_grid']['configuration']['chunk_shape']
+      if not _divides(local_shape, chunk_shape):
+        raise ValueError(f"Provided chunk shape {chunk_shape} does not divide"
+                         f" the local shape of the array {local_shape}")
+  # check path is still the same one we expect
+  if ocdbt:
+    found_path = spec["kvstore"]['base']['path']
+  else:
+    found_path = spec["kvstore"]['path']
+  if str(found_path) != str(path):
+    raise ValueError(f"Provided {path=} does not match the spec path:"
+                     f" {spec['kvstore']}")
 
 def _spec_has_metadata(tree):
   if not isinstance(tree, dict):

@@ -25,7 +25,6 @@ from concurrent.futures import Future
 from typing import Any, TypeVar
 
 import jax
-from jax.tree_util import default_registry as _default_registry
 from jax._src.export.serialization import (flatbuffers, _serialize_pytreedef,
                                            _deserialize_pytreedef_to_pytree,
                                            ser_flatbuf)
@@ -45,6 +44,9 @@ _NOT_REGISTERED_MESSAGE = (
   "  * If you want to register a custom node, register is via"
   " `register_pytree_node_serialization`")
 
+__all__ = ["serialize_pytreedef", "deserialize_pytreedef",
+           "register_pytree_node_serialization"]
+
 class AwaitableFuture(Future[Any]):
   """A wrapper around a Future that makes it look like an async function."""
   def __init__(self, future: Future[Any]):
@@ -62,12 +64,10 @@ class AwaitableFuture(Future[Any]):
       yield
     return self.result()
 
-class _MISSING_TYPE:
-  pass
-MISSING = _MISSING_TYPE()
 
 def _cls2typerepr(cls):
   return f"{cls.__module__}.{cls.__name__}"
+
 
 def _serialize_pytreedef_export(node) -> dict[str, Any]:
   builder = flatbuffers.Builder(65536)
@@ -78,6 +78,7 @@ def _serialize_pytreedef_export(node) -> dict[str, Any]:
   pytree_repr = {_TREE_REPR_KEY: root_repr,
                  _LEAF_IDS_KEY: list(range(leaf_count))}
   return pytree_repr
+
 
 def _deserialize_pytreedef_export(pytreedef_repr: dict[str, Any]):
   buf = base64.b64decode(pytreedef_repr[_TREE_REPR_KEY])

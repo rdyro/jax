@@ -880,6 +880,10 @@ jax_multiplatform_test(
     deps = [
         "//jax/_src:internal_test_util",
         "//jax/_src:lax_reference",
+        # imports for experimental pallas lowerings of lax ops
+        "//jax/experimental:pallas_triton",
+        "//jax/experimental:pallas",
+        "//jax/_src/lax/pallas_lowerings/gpu:ragged_dot",
     ] + py_deps([
         "numpy",
         "absl/testing",

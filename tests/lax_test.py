@@ -44,6 +44,10 @@ from jax._src.errors import UnexpectedTracerError
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.internal_test_util import lax_test_util
+# an experimental pallas-triton ragged dot lowering for ragged_dot_general
+# this import adds an optional GPU lowering for ragged_dot_general
+from jax._src.lax.pallas_lowerings.gpu import (
+  ragged_dot as _pallas_triton_ragged_dot)  # noqa: F401
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import utils as lax_utils
 from jax._src.util import safe_zip
@@ -86,7 +90,17 @@ def _reduce_custom_max(x, y):
   return jnp.maximum(x, y)
 
 
-class LaxTest(jtu.JaxTestCase):
+class LaxTestBase(jtu.JaxTestCase):
+  def setUp(self):
+    # lax tests can now experimentally depend on pallas, whose import can
+    # trigger a new environment flag registration by lazily initializing the
+    # pallas plugin on GPU, so we force the backend initialization in the test
+    # class setup to avoid new flag registration midway through a test, because
+    # the test harness treats modifying the environment as a test failure.
+    jtu.test_device_matches([])
+    super().setUp()
+
+class LaxTest(LaxTestBase):
   """Numerical tests for LAX operations."""
 
   @parameterized.parameters(itertools.chain.from_iterable(
@@ -3825,7 +3839,7 @@ class LaxTest(jtu.JaxTestCase):
       jax.jacobian(f)(x, y)
 
 
-class LazyConstantTest(jtu.JaxTestCase):
+class LazyConstantTest(LaxTestBase):
   def _Check(self, make_const, expected):
     # check casting to ndarray works
     asarray_result = np.asarray(make_const())
@@ -4137,7 +4151,7 @@ def bake_vmap(batched_args, batch_dims):
 # All tests in this test class are thread-hostile because they add and remove
 # primitives from global maps.
 @jtu.thread_unsafe_test_class()  # registration isn't thread-safe
-class CustomElementTypesTest(jtu.JaxTestCase):
+class CustomElementTypesTest(LaxTestBase):
 
   def setUp(self):
     core.pytype_aval_mappings[FooArray] = \
@@ -4432,7 +4446,7 @@ class CustomElementTypesTest(jtu.JaxTestCase):
   # TODO(frostig,mattjj): more polymorphic primitives tests
 
 
-class FunctionAccuracyTest(jtu.JaxTestCase):
+class FunctionAccuracyTest(LaxTestBase):
 
   @parameterized.named_parameters(
     dict(testcase_name=f"_{dtype.__name__}", dtype=dtype)
@@ -4758,7 +4772,7 @@ class FunctionAccuracyTest(jtu.JaxTestCase):
         )
 
 
-class CompositeTest(jtu.JaxTestCase):
+class CompositeTest(LaxTestBase):
 
   def test_composite(self):
     def my_square_impl(x):
@@ -4995,7 +5009,7 @@ class CompositeTest(jtu.JaxTestCase):
       jax.jit(fun)(x, scale)
 
 
-class RaggedTest(jtu.JaxTestCase):
+class RaggedTest(LaxTestBase):
 
   def _test_ragged_dot(self, m, k, n, num_groups, dtype):
     """Tests ragged_dot.
@@ -5037,6 +5051,11 @@ class RaggedTest(jtu.JaxTestCase):
       dtype=jtu.dtypes.all_floating,
   )
   def test_ragged_dot(self, m, k, n, num_groups, dtype):
+    if (jtu.test_device_matches(["cuda"])
+        and config.jax_ragged_dot_use_gpu_pallas_triton_lowering.value
+        and dtype == jnp.float64):
+      raise SkipTest("Triton ragged dot lowering is not implemented for "
+                     "float64.")
     return self._test_ragged_dot(m, k, n, num_groups, dtype)
 
   @parameterized.parameters([True, False])
@@ -5046,6 +5065,23 @@ class RaggedTest(jtu.JaxTestCase):
       if jtu.test_device_matches(["tpu"]) and use_instruction:
         self.assertIn(
             "chlo.ragged_dot",
+            jax.jit(lax.ragged_dot)
+            .lower(
+                core.ShapedArray((16, 4), dtype=jnp.float32),
+                core.ShapedArray((2, 4, 3), dtype=jnp.float32),
+                core.ShapedArray((2,), dtype=jnp.int32),
+            )
+            .as_text(dialect="stablehlo"),
+        )
+
+  @parameterized.parameters([True, False])
+  def test_ragged_dot_use_gpu_pallas_triton_lowering(self, use_instruction):
+    with config.jax_ragged_dot_use_gpu_pallas_triton_lowering(use_instruction):
+      self._test_ragged_dot(16, 4, 3, 2, jnp.float32)
+      if (use_instruction and jtu.test_device_matches(["cuda"])
+          and jtu.is_cuda_compute_capability_at_least("8.0")):
+        self.assertIn(
+            "pallas_triton_ragged_dot",
             jax.jit(lax.ragged_dot)
             .lower(
                 core.ShapedArray((16, 4), dtype=jnp.float32),
@@ -5367,7 +5403,7 @@ class RaggedTest(jtu.JaxTestCase):
           batch_res[i, 0:upper_bound, :], ref_res, rtol=tol, atol=tol
       )
 
-class LaxUtilsTest(jtu.JaxTestCase):
+class LaxUtilsTest(LaxTestBase):
 
   def test_int_dtype_for_dim(self):
     self.assertEqual(lax_utils.int_dtype_for_dim(10, signed=True), np.int32)

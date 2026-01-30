@@ -248,6 +248,8 @@ py_library_providing_imports_info(
         "//jax/_src:xla_metadata",
         "//jax/_src:xla_metadata_lib",
         "//jax/_src/lib",
+        # pallas lowerings for lax ops
+        "//jax/_src/lax/pallas_lowerings/gpu:ragged_dot",
     ] + py_deps("numpy") + py_deps("opt_einsum") + py_deps("flatbuffers") + jax_extra_deps,
 )
 

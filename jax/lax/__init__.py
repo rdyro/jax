@@ -405,6 +405,12 @@ from jax._src.pjit import sharding_constraint_p as sharding_constraint_p
 from jax._src.dispatch import device_put_p as device_put_p
 from jax._src.lax.scaled_dot import scaled_dot as scaled_dot
 
+# an experimental pallas-triton ragged dot lowering for ragged_dot_general
+# this import adds an optional GPU lowering for ragged_dot_general
+from jax._src.lax.pallas_lowerings.gpu import (
+  ragged_dot as _pallas_triton_ragged_dot)  # noqa: F401
+
+
 _deprecations = {
     # Deprecated in v0.7.1; finalized in v0.9.0.
     # TODO(jakevdp) remove entry in v0.10.0.

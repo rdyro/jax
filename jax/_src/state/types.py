@@ -319,6 +319,12 @@ class TransformedRef:
   def __setitem__(self, slc, value):
     from jax._src.state.primitives import ref_set # pytype: disable=import-error
     return ref_set(self, slc, value)
+    
+# register TransformedRef with the two regitries for jit
+tree_util.pjit_registry.register_dataclass_node(
+  TransformedRef, ("ref",), ("transforms",))
+tree_util.dispatch_registry.register_dataclass_node(
+  TransformedRef, ("ref",), ("transforms",))
 
 
 def transform_type(

@@ -70,6 +70,16 @@ dispatch_registry = pytree.PyTreeRegistry(
 dispatch_registry.__module__ = __name__
 dispatch_registry.__name__ = "dispatch_registry"  # pyrefly: ignore[missing-attribute]
 
+# A special, internal pytree registry that includes everything in
+# `default_registry`, plus types we want pjit to treat as pytree nodes, but user
+# code should treat as leafs, the current primary example is TransformedRef.
+pjit_registry = pytree.PyTreeRegistry()
+pjit_registry.__module__ = __name__
+pjit_registry.__name__ = "pjit_registry"  # pyrefly: ignore[missing-attribute]
+
+ALL_REGISTRIES = [default_registry, none_leaf_registry, dispatch_registry,
+                  pjit_registry]
+
 
 @export
 def tree_flatten(tree: Any,
@@ -298,15 +308,10 @@ def register_pytree_node(
     >>> jax.jit(f)(m)
     Array([1., 2., 3., 4., 5.], dtype=float32)
   """
-  default_registry.register_node(
-      nodetype, flatten_func, unflatten_func, flatten_with_keys_func
-  )
-  none_leaf_registry.register_node(
-      nodetype, flatten_func, unflatten_func, flatten_with_keys_func
-  )
-  dispatch_registry.register_node(
-      nodetype, flatten_func, unflatten_func, flatten_with_keys_func
-  )
+  for registry in ALL_REGISTRIES:
+    registry.register_node(
+        nodetype, flatten_func, unflatten_func, flatten_with_keys_func
+    )
   _registry[nodetype] = _RegistryEntry(flatten_func, unflatten_func)
 
 
@@ -1160,9 +1165,9 @@ def register_dataclass(
     data = tuple(getattr(x, name) for name in data_fields)
     return data, meta
 
-  default_registry.register_dataclass_node(nodetype, list(data_fields), list(meta_fields))
-  none_leaf_registry.register_dataclass_node(nodetype, list(data_fields), list(meta_fields))
-  dispatch_registry.register_dataclass_node(nodetype, list(data_fields), list(meta_fields))
+  for registry in ALL_REGISTRIES:
+    registry.register_dataclass_node(nodetype,
+                                     list(data_fields), list(meta_fields))
   _registry[nodetype] = _RegistryEntry(flatten_func, unflatten_func)
   return nodetype
 
@@ -1377,6 +1382,10 @@ class FlatTree:
        the tuple-returning function would change the tree structure and `unzip`
        wouldn't be able to recover it.
   """
+
+  _tree_flatten = pjit_registry.flatten
+  _treedef_tuple = lambda trees: pytree.treedef_tuple(pjit_registry, list(trees))
+
   # `FlatTree` constructor is private. Use `FlatTree.flatten` instead
   def __init__(self, vals, treedef: PyTreeDef, statics):
     assert isinstance(treedef, pytree.PyTreeDef)
@@ -1433,7 +1442,7 @@ class FlatTree:
         vals.extend(child.vals)
         trees.append(child.tree)
         staticss.append(child.statics)
-      return FlatTree(vals, treedef_tuple(trees), tuple(staticss))
+      return FlatTree(vals, FlatTree._treedef_tuple(trees), tuple(staticss))
     elif isinstance(tree, dict):
       # only empty case handled for now
       if tree == {}:
@@ -1458,7 +1467,7 @@ class FlatTree:
 
   @staticmethod
   def flatten(tree: PyTree) -> FlatTree:
-    vals, tree = tree_flatten(tree)
+    vals, tree = FlatTree._tree_flatten(tree)
     return FlatTree(vals, tree, False)
 
   @staticmethod
@@ -1472,7 +1481,7 @@ class FlatTree:
       statics = tuple(i in static_argnums for i, _ in enumerate(args))
       tree_with_statics = tuple(
           Static(x) if static else x for static, x in zip(statics, args))
-      vals, treedef = tree_flatten(tree_with_statics)
+      vals, treedef = FlatTree._tree_flatten(tree_with_statics)
       return FlatTree(vals, treedef, statics=statics)
 
   @staticmethod
@@ -1484,7 +1493,7 @@ class FlatTree:
       statics = {k : k in static_argnames for k, _ in kwargs.items()}
       tree_with_statics = {k : Static(v) if statics[k] else v
                            for k, v in kwargs.items()}
-      vals, treedef = tree_flatten(tree_with_statics)
+      vals, treedef = FlatTree._tree_flatten(tree_with_statics)
       return FlatTree(vals, treedef, statics=statics)
 
   @staticmethod

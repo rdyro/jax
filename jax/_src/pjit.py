@@ -69,14 +69,23 @@ from jax._src.layout import Format, Layout, AutoLayout, get_layout_for_vmap
 from jax._src.state.types import RefEffect
 from jax._src.traceback_util import api_boundary
 from jax._src.tree_util import (
-    tree_flatten, tree_unflatten, treedef_is_leaf, tree_structure,
+    tree_unflatten, treedef_is_leaf,
     treedef_children, prefix_errors, PyTreeDef, none_leaf_registry as none_lr,
-    tree_map, FlatTree)
+    tree_map, FlatTree, pjit_registry)
 from jax._src.typing import ArrayLike
 from jax._src.util import (
     HashableFunction, safe_map, safe_zip, wraps, distributed_debug_log,
     split_list, weakref_lru_cache, merge_lists, subs_list, fun_name)
 from jax._src.lib import jax_jit
+
+
+# for the purposes of pjit, we're using the pjit registry file wide
+def tree_flatten(tree: Any, is_leaf: Callable[[Any], bool] | None = None):
+  return pjit_registry.flatten(tree, is_leaf)
+
+def tree_structure(tree: Any, is_leaf: None | (Callable[[Any], bool]) = None):
+  return pjit_registry.flatten(tree, is_leaf)[1]
+
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -598,7 +607,7 @@ def _infer_params(
 
   arg_signature, dynargs = jax_jit.parse_arguments(
       args, tuple(kwargs.values()), tuple(kwargs.keys()), ji.static_argnums,
-      ji.static_argnames, tree_util.default_registry)
+      ji.static_argnames, tree_util.pjit_registry)
   avals = _infer_input_type(fun, dbg_fn, dynargs)
   entry = _infer_params_cached(fun, ji, arg_signature, avals, ctx_mesh)
 

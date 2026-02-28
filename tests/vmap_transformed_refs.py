@@ -20,10 +20,12 @@ from jax._src import config
 
 config.parse_flags_with_absl()
 
+_cond = lambda fn: lambda *args: jax.lax.cond(jnp.array(True), fn, fn, *args)
+
 
 class VmapTransformedRefsTest(jtu.JaxTestCase):
 
-  @jtu.parameterized.product(transform=[jax.vmap, jax.remat])
+  @jtu.parameterized.named_parameters(("vmap", jax.vmap), ("remat", jax.remat), ("cond", _cond), ("jit", jax.jit))
   def test_read_transformed_ref(self, transform):
     """vmap should be able to read from a TransformedRef (ref.at[slice])."""
     @jax.jit
@@ -35,7 +37,7 @@ class VmapTransformedRefsTest(jtu.JaxTestCase):
     expected = jnp.arange(10, dtype=jnp.float32)[2:7]
     self.assertAllClose(f(), expected)
 
-  @jtu.parameterized.product(transform=[jax.vmap, jax.remat])
+  @jtu.parameterized.named_parameters(("vmap", jax.vmap), ("remat", jax.remat), ("cond", _cond), ("jit", jax.jit))
   def test_write_transformed_ref(self, transform):
     """vmap/remat should be able to write to a TransformedRef (ref.at[slice])."""
     @jax.jit
@@ -49,7 +51,7 @@ class VmapTransformedRefsTest(jtu.JaxTestCase):
     expected = jnp.zeros(10).at[2:7].set(1.0)
     self.assertAllClose(f(), expected)
 
-  @jtu.parameterized.product(transform=[jax.vmap, jax.remat])
+  @jtu.parameterized.named_parameters(("vmap", jax.vmap), ("remat", jax.remat), ("cond", _cond), ("jit", jax.jit))
   def test_addupdate_transformed_ref(self, transform):
     """vmap/remat should be able to addupdate a TransformedRef."""
     @jax.jit

@@ -269,7 +269,22 @@ def cond(pred, true_fun: Callable, false_fun: Callable, *operands,
 
   args = FlatTree.flatten((operands, {}))
   dbg_true = api_util.debug_info("cond", true_fun, operands, {})
-  api_util.check_no_transformed_refs_args(lambda: dbg_true, args.vals)
+  # api_util.check_no_transformed_refs_args(lambda: dbg_true, args.vals)
+  # Decompose TransformedRefs so underlying ref (a tracer) stays in the trace
+  # and ReadEffect/WriteEffect don't leak as unlowerable effects.
+  from jax._src.state.types import TransformedRef
+  tr_map = {i: x.transforms for i, x in enumerate(args.vals) if isinstance(x, TransformedRef)}
+  if tr_map:
+    args = args.update(x.ref if isinstance(x, TransformedRef) else x for x in args.vals)
+    def _wrap_fun(fn):
+      def wrapped(*operands, **kwargs):
+        flat, tree = tree_flatten((operands, kwargs))
+        for i, transforms in tr_map.items():
+          flat[i] = TransformedRef(flat[i], transforms)
+        operands, kwargs = tree_unflatten(tree, flat)
+        return fn(*operands, **kwargs)
+      return wrapped
+    true_fun, false_fun = _wrap_fun(true_fun), _wrap_fun(false_fun)
   avals = args.map(core.get_aval)
   avals = avals.map2(
       lambda a, x: core.AvalQDD(a, cur_qdd(x)) if a.has_qdd else a,

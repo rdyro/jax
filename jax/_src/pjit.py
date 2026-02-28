@@ -589,6 +589,20 @@ def _infer_params_cached(
 def _infer_params(
     fun: Callable, ji: PjitInfo, args: tuple[Any, ...], kwargs: dict[str, Any]
   ) -> tuple[PjitParams, list[core.Value]]:
+  # Decompose TransformedRefs so underlying ref (a tracer) is visible to dispatch
+  from jax._src.state.types import TransformedRef
+  args_flat, in_tree = tree_flatten((args, kwargs))
+  tr_map = {i: x.transforms for i, x in enumerate(args_flat) if isinstance(x, TransformedRef)}
+  if tr_map:
+    args_flat = [x.ref if isinstance(x, TransformedRef) else x for x in args_flat]
+    args, kwargs = tree_unflatten(in_tree, args_flat)
+    orig_fun = fun
+    def fun(*a, **kw):
+      flat, tree = tree_flatten((a, kw))
+      for i, transforms in tr_map.items():
+        flat[i] = TransformedRef(flat[i], transforms)
+      a, kw = tree_unflatten(tree, flat)
+      return orig_fun(*a, **kw)
   ctx_mesh = (mesh_lib.thread_resources.env.physical_mesh
               if ji.use_resource_env else mesh_lib.get_concrete_mesh())
   dbg_fn = lambda: debug_info(

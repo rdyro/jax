@@ -1185,7 +1185,7 @@ def vmap(fun: F,
 
     args_flat, in_tree  = tree_flatten((args, kwargs), is_leaf=batching.is_vmappable)
     dbg = debug_info("vmap", fun, args, kwargs)
-    api_util.check_no_transformed_refs_args(lambda: dbg, args_flat)
+    # api_util.check_no_transformed_refs_args(lambda: dbg, args_flat)
     f = lu.wrap_init(fun, debug_info=dbg)
     flat_fun, out_tree = batching.flatten_fun_for_vmap(f, in_tree)
     in_axes_flat = flatten_axes("vmap in_axes", in_tree, (in_axes, 0), kws=True)
@@ -1197,6 +1197,10 @@ def vmap(fun: F,
 
     axis_size_ = (axis_size if axis_size is not None else
                   _mapped_axis_size(fun, in_tree, args_flat, in_axes_flat, "vmap"))
+    # if any(isinstance(x, TransformedRef) for x in args_flat):
+    #   explicit_mesh_axis = tuple(P() for _ in args_flat)
+    # else:
+    #   explicit_mesh_axis = _mapped_axis_spec(args_flat, in_axes_flat)
     explicit_mesh_axis = _mapped_axis_spec(args_flat, in_axes_flat)
     _check_ema_unmapped_args(explicit_mesh_axis, args_flat, in_axes_flat)
     if spmd_axis_name is not None and explicit_mesh_axis is not None:

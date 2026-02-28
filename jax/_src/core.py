@@ -632,6 +632,7 @@ class Primitive:
     return f'{self.name}'
 
   def bind(self, *args, **params):
+    # self.skip_canonicalization = True
     args = args if self.skip_canonicalization else map(canonicalize_value, args)
     return self._true_bind(*args, **params)
 

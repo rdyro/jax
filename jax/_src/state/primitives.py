@@ -797,6 +797,12 @@ def _get_vmap(batched_args, batched_dims, *, tree):
   ref, *flat_idxs = batched_args
   ref_dim, *flat_idx_dims = batched_dims
   indexers = tree_util.tree_unflatten(tree, flat_idxs)
+  # TransformedRef: decompose into underlying ref + composed transforms so the
+  # underlying ref (a tracer) stays in the trace and ReadEffect doesn't leak.
+  if isinstance(ref, TransformedRef):
+    all_transforms = (*ref.transforms, *indexers)
+    flat_all, new_tree = tree_util.tree_flatten(all_transforms)
+    return get_p.bind(ref.ref, *flat_all, tree=new_tree), ref_dim
   if not indexers:
     return get_p.bind(ref, *flat_idxs, tree=tree), ref_dim
   indexers_dims = tree_util.tree_unflatten(tree, flat_idx_dims)
@@ -881,6 +887,14 @@ def _swap_vmap(axis_data, batched_args, batched_dims, *, tree):
                     f"an unbatched array reference of type {core.typeof(ref)}. "
                     "Move the array reference to be an argument to the vmapped "
                     "function?")
+  # TransformedRef: decompose into underlying ref + composed transforms.
+  if isinstance(ref, TransformedRef):
+    if ref_is_batched and not val_is_batched:
+      val = batching.broadcast(val, axis_data.size, ref_dim,
+                               axis_data.explicit_mesh_axis)
+    all_transforms = (*ref.transforms, *indexers)
+    flat_all, new_tree = tree_util.tree_flatten(all_transforms)
+    return swap_p.bind(ref.ref, val, *flat_all, tree=new_tree), ref_dim
   if not indexers:
     if ref_is_batched and not val_is_batched:
       val = batching.broadcast(val, axis_data.size, ref_dim,
@@ -964,6 +978,13 @@ def _addupdate_vmap(axis_data, batched_args, batched_dims, *, tree):
                     f"an unbatched array reference of type {core.typeof(ref)}. "
                     "Move the array reference to be an argument to the vmapped "
                     "function?")
+  # TransformedRef: decompose into underlying ref + composed transforms.
+  if isinstance(ref, TransformedRef):
+    if val_dim != ref_dim:
+      val = batching.matchaxis2(axis_data, val_dim, ref_dim, val)
+    all_transforms = (*ref.transforms, *indexers)
+    flat_all, new_tree = tree_util.tree_flatten(all_transforms)
+    return addupdate_p.bind(ref.ref, val, *flat_all, tree=new_tree), []
   if not indexers:
     if val_dim != ref_dim:
       val = batching.matchaxis2(axis_data, val_dim, ref_dim, val)

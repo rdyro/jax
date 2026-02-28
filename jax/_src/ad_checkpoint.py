@@ -376,7 +376,19 @@ def checkpoint(fun: Callable, *, prevent_cse: bool | Sequence[bool] = True,
         args, kwargs, static_argnums=static_argnums)
     fun_, args = _remat_static_argnums(fun, static_argnums, args)
     args_flat, in_tree = tree_flatten((args, kwargs))
-    api_util.check_no_transformed_refs_args(lambda: debug, args_flat)
+    # Decompose TransformedRefs so the underlying ref (a tracer) stays in the
+    # trace and ReadEffect/WriteEffect don't leak as unlowerable effects.
+    from jax._src.state.types import TransformedRef
+    tr_map = {i: x.transforms for i, x in enumerate(args_flat) if isinstance(x, TransformedRef)}
+    if tr_map:
+      args_flat = [x.ref if isinstance(x, TransformedRef) else x for x in args_flat]
+      orig_fun_ = fun_
+      def fun_(*a, **kw):
+        flat, tree = tree_flatten((a, kw))
+        for i, transforms in tr_map.items():
+          flat[i] = TransformedRef(flat[i], transforms)
+        a, kw = tree_unflatten(tree, flat)
+        return orig_fun_(*a, **kw)
     in_avals = [core.shaped_abstractify(x) for x in args_flat]
     jaxpr, consts, out_tree = _trace_to_jaxpr(fun_, in_tree, tuple(in_avals), debug)
     if isinstance(prevent_cse, tuple):

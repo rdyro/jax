@@ -23,39 +23,42 @@ config.parse_flags_with_absl()
 
 class VmapTransformedRefsTest(jtu.JaxTestCase):
 
-  def test_vmap_read_transformed_ref(self):
+  @jtu.parameterized.product(transform=[jax.vmap, jax.remat])
+  def test_read_transformed_ref(self, transform):
     """vmap should be able to read from a TransformedRef (ref.at[slice])."""
     @jax.jit
     def f():
       x_ref = jax.new_ref(jnp.arange(10, dtype=jnp.float32))
       x_view = x_ref.at[2:7]  # TransformedRef, shape (5,)
-      result = jax.vmap(lambda v: v[...])(x_view)
+      result = transform(lambda v: v[...])(x_view)
       return result
     expected = jnp.arange(10, dtype=jnp.float32)[2:7]
     self.assertAllClose(f(), expected)
 
-  def test_vmap_write_transformed_ref(self):
-    """vmap should be able to write to a TransformedRef (ref.at[slice])."""
+  @jtu.parameterized.product(transform=[jax.vmap, jax.remat])
+  def test_write_transformed_ref(self, transform):
+    """vmap/remat should be able to write to a TransformedRef (ref.at[slice])."""
     @jax.jit
     def f():
       x_ref = jax.new_ref(jnp.zeros(10, dtype=jnp.float32))
       x_view = x_ref.at[2:7]
       def body(v):
-        v[...] = 1.0
-      jax.vmap(body)(x_view)
+        v[...] = jnp.ones_like(v)
+      transform(body)(x_view)
       return x_ref[...]
     expected = jnp.zeros(10).at[2:7].set(1.0)
     self.assertAllClose(f(), expected)
 
-  def test_vmap_addupdate_transformed_ref(self):
-    """vmap should be able to addupdate a TransformedRef."""
+  @jtu.parameterized.product(transform=[jax.vmap, jax.remat])
+  def test_addupdate_transformed_ref(self, transform):
+    """vmap/remat should be able to addupdate a TransformedRef."""
     @jax.jit
     def f():
       x_ref = jax.new_ref(jnp.ones(10, dtype=jnp.float32))
       x_view = x_ref.at[2:7]
       def body(v):
         v[...] += 1.0
-      jax.vmap(body)(x_view)
+      transform(body)(x_view)
       return x_ref[...]
     expected = jnp.ones(10).at[2:7].add(1.0)
     self.assertAllClose(f(), expected)

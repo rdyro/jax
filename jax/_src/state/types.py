@@ -323,10 +323,11 @@ class TransformedRef:
 class TransformedRefAvalError(Exception):
   pass
 
-def disallow_transformed_ref_avals(_):
-  raise TransformedRefAvalError("TransformedRefs cannot be abstractified.")
 
-core.pytype_aval_mappings[TransformedRef] = disallow_transformed_ref_avals
+def transformed_ref_avals(x):
+  return x.type
+
+core.pytype_aval_mappings[TransformedRef] = transformed_ref_avals
 
 
 def transform_type(

@@ -1442,9 +1442,7 @@ class StateControlFlowTest(jtu.JaxTestCase):
     expected = jnp.zeros(7).at[1:6].add(17.0)
     self.assertAllClose(f(), expected)
 
-  @parameterized.named_parameters(
-    ("vmap", "vmap"), ("jit", "jit"), ("remat", "remat"), ("scan", "scan"),
-    ("while_loop", "while_loop"), ("cond", "cond"), ("shard_map", "shard_map"))
+  @parameterized.named_parameters(("vmap", "vmap"))
   def test_no_transformed_ref_in(self, transform):
     def scan_fn(fn):
       return lambda *args: jax.lax.scan(

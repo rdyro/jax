@@ -31,6 +31,7 @@ from jax._src import traceback_util
 from jax._src import tree_util
 from jax._src.typing import Array
 from jax._src.util import safe_map, safe_zip
+from jax._src.tree_util import tracing_registry, _registry, _RegistryEntry
 import numpy as np
 
 ## JAX utilities
@@ -234,7 +235,6 @@ class RefIndexer:
       return TransformedRef(view.ref, (*view.transforms, indexer))
     return TransformedRef(self.ref_or_view, (indexer,))
 
-
 @dataclasses.dataclass(frozen=True)
 class TransformedRef:
   ref: Any
@@ -320,11 +320,19 @@ class TransformedRef:
     from jax._src.state.primitives import ref_set  # pytype: disable=import-error
     return ref_set(self, slc, value)
 
+
+unflatten_func = lambda meta, data: TransformedRef(*data)
+flatten_func = lambda x: (x.ref, x.transforms), None
+tracing_registry.register_dataclass_node(TransformedRef, ["ref", "transforms"], [])
+_registry[TransformedRef] = _RegistryEntry(flatten_func, unflatten_func)
+
+
 class TransformedRefAvalError(Exception):
   pass
 
 def disallow_transformed_ref_avals(_):
-  raise TransformedRefAvalError("TransformedRefs cannot be abstractified.")
+  return _.type
+  #raise TransformedRefAvalError("TransformedRefs cannot be abstractified.")
 
 core.pytype_aval_mappings[TransformedRef] = disallow_transformed_ref_avals
 

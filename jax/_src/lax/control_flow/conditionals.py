@@ -335,6 +335,7 @@ def _check_branch_outputs(
     paths = [None] * len(out_avals1)
     component = lambda _: ''
   else:
+    # outs cannot contained TransformedRefs, so regular tree_flatten is ok
     leaves_and_paths, _ = tree_flatten_with_path(outs1)
     paths, _ = unzip2(leaves_and_paths)
     component = lambda p: f' at path {keystr(p)}' if p else ''

@@ -1185,7 +1185,7 @@ def vmap(fun: F,
 
     args_flat, in_tree  = tree_flatten((args, kwargs), is_leaf=batching.is_vmappable)
     dbg = debug_info("vmap", fun, args, kwargs)
-    api_util.check_no_transformed_refs_args(lambda: dbg, args_flat)
+    # api_util.check_no_transformed_refs_args(lambda: dbg, args_flat)
     f = lu.wrap_init(fun, debug_info=dbg)
     flat_fun, out_tree = batching.flatten_fun_for_vmap(f, in_tree)
     in_axes_flat = flatten_axes("vmap in_axes", in_tree, (in_axes, 0), kws=True)

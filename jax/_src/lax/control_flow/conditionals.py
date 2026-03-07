@@ -23,9 +23,19 @@ import operator
 from typing import Any, TypeVar
 
 from jax._src.tree_util import (
-    tree_flatten, tree_unflatten, tree_flatten_with_path, keystr,
-    equality_errors_pytreedef, FlatTree)
+    PyTreeDef, tree_flatten as _tree_flatten, tree_unflatten as _tree_unflatten,
+    tree_flatten_with_path as _tree_flatten_with_path, keystr,
+    equality_errors_pytreedef, FlatTree, tracing_registry)
 from jax._src import ad_util
+
+def tree_flatten(tree):
+  return tracing_registry.flatten(tree)
+
+def tree_unflatten(treedef, leaves):
+  return treedef.unflatten(leaves)
+
+def tree_flatten_with_path(tree):
+  return tracing_registry.flatten_with_path(tree)
 from jax._src import api_util
 from jax._src import config
 from jax._src import core

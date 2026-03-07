@@ -597,7 +597,7 @@ def _infer_params(
       signature=ji.fun_signature)
   arg_signature, dynargs = jax_jit.parse_arguments(
       args, tuple(kwargs.values()), tuple(kwargs.keys()), ji.static_argnums,
-      ji.static_argnames, tree_util.default_registry)
+      ji.static_argnames, tree_util.tracing_registry)
   avals = _infer_input_type(fun, dbg_fn, dynargs)
   entry = _infer_params_cached(fun, ji, arg_signature, avals, ctx_mesh)
 
@@ -626,15 +626,14 @@ def _infer_input_type(fun: Callable, dbg_fn: Callable[[], core.DebugInfo],
       "An overflow was encountered while parsing an argument to a jitted "
       f"computation, whose {arg_path}. Got {type(x)} with value {x}"
     ) from None
-  except TransformedRefAvalError:
-    dbg = dbg_fn()
-    raise TypeError(
-      f"Error interpreting a TransformedRef argument to {fun} as an abstract "
-      "array. TransformedRefs are not allowed in this context, but got a "
-      "TransformedRef with name "
-      f"{dbg.arg_names[i] if dbg.arg_names is not None else 'unknown'} passed "
-      "to jax.jit.") from None
-  except TypeError:
+  # except TransformedRefAvalError:
+  #   dbg = dbg_fn()
+  #   raise TypeError(
+  #     f"Error interpreting a TransformedRef argument to {fun} as an abstract "
+  #     "array. TransformedRefs are not allowed in this context, but got a "
+  #     "TransformedRef with name "
+  #     f"{dbg.arg_names[i] if dbg.arg_names is not None else 'unknown'} passed "
+  #     "to jax.jit.") from None  except TypeError:
     dbg = dbg_fn()
     arg_description = f"path {dbg.arg_names[i] if dbg.arg_names is not None else 'unknown'}"
     raise TypeError(

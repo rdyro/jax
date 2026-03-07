@@ -47,11 +47,32 @@ from jax._src.state import discharge
 from jax._src.state.types import AbstractRef
 from jax._src.traceback_util import api_boundary
 from jax._src.tree_util import (
-    PyTreeDef, tree_flatten, tree_unflatten, tree_structure, broadcast_prefix,
-    tree_map)
+    PyTreeDef, tree_flatten as _tree_flatten, tree_unflatten,
+    tree_structure as _tree_structure, broadcast_prefix as _broadcast_prefix,
+    tree_map as _tree_map, tracing_registry)
 from jax._src.typing import DeprecatedArg
 from jax._src.util import (unzip2, wraps, split_list, partition_list, safe_map,
                            safe_zip, merge_lists, weakref_lru_cache)
+
+def tree_flatten(tree):
+  return tracing_registry.flatten(tree)
+
+def tree_structure(tree):
+  return tracing_registry.flatten(tree)[1]
+
+def tree_map(f, *args, **kwargs):
+  # Extract `is_leaf` from kwargs, if present
+  is_leaf = kwargs.get('is_leaf')
+  leaves, treedef = tracing_registry.flatten(args[0], is_leaf)
+  all_leaves = [leaves] + [tracing_registry.flatten(r, is_leaf)[0] for r in args[1:]]
+  return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+
+def broadcast_prefix(prefix_tree, full_tree, is_leaf=None):
+  from jax._src.tree_util import broadcast_flattened_prefix_with_treedef
+  prefix_leaves, prefix_treedef = tracing_registry.flatten(prefix_tree, is_leaf)
+  full_treedef = tracing_registry.flatten(full_tree, is_leaf)[1]
+  return broadcast_flattened_prefix_with_treedef(
+      prefix_leaves, prefix_treedef, full_treedef)
 
 source_info_util.register_exclusion(__file__)
 traceback_util.register_exclusion(__file__)

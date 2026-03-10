@@ -70,10 +70,28 @@ class TransformedRefsTest(jtu.JaxTestCase):
     self.assertAllClose(f(True), expected_true)
     self.assertAllClose(f(False), expected_false)
 
+  def test_transformed_ref_in_vmap(self):
+    @jax.jit
+    def f(xs):
+      x_ref = jax.new_ref(jnp.zeros((7, 3)))
+      x_ref_view = x_ref.at[1:6]
+
+      def inner(x_ref_view, x):
+        x_ref_view[...] += x
+
+      jax.vmap(inner, in_axes=(0, 0))(x_ref_view, xs)
+      return x_ref[...]
+
+    xs = jnp.ones((5, 3))
+    expected = jnp.zeros((7, 3)).at[1:6].add(xs)
+    self.assertAllClose(f(xs), expected)
+
   @parameterized.named_parameters(
       ("remat", jax.remat), ("cond", _cond), ("jit", jax.jit),
-      ("shard_map", partial(shard_map, out_specs=P())))
+      ("shard_map", partial(shard_map, out_specs=P()))
+  )
   def test_read_transformed_ref(self, transform):
+    """vmap should be able to read from a TransformedRef (ref.at[slice])."""
     @jax.jit
     def f():
       x_ref = jax.new_ref(jnp.arange(10, dtype=jnp.float32))
@@ -85,7 +103,7 @@ class TransformedRefsTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(("false", False), ("true", True))
   def test_temp(self, pure_ref):
-    """remat should be able to write to a TransformedRef (ref.at[slice])."""
+    """vmap/remat should be able to write to a TransformedRef (ref.at[slice])."""
     x_ref = jax.new_ref(jnp.zeros(10, dtype=jnp.float32))
     @jax.jit
     def f(x_ref):
@@ -108,7 +126,7 @@ class TransformedRefsTest(jtu.JaxTestCase):
       ("shard_map", partial(shard_map, out_specs=None))
   )
   def test_write_transformed_ref(self, transform):
-    """remat should be able to write to a TransformedRef (ref.at[slice])."""
+    """vmap/remat should be able to write to a TransformedRef (ref.at[slice])."""
     @jax.jit
     def f():
       x_ref = jax.new_ref(jnp.zeros(10, dtype=jnp.float32))
@@ -125,7 +143,7 @@ class TransformedRefsTest(jtu.JaxTestCase):
       ("shard_map", partial(shard_map, out_specs=None))
   )
   def test_addupdate_transformed_ref(self, transform):
-    """remat should be able to addupdate a TransformedRef."""
+    """vmap/remat should be able to addupdate a TransformedRef."""
     @jax.jit
     def f():
       x_ref = jax.new_ref(jnp.ones(10, dtype=jnp.float32))

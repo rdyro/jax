@@ -796,8 +796,16 @@ def _get_vmap(batched_args, batched_dims, *, tree):
                 if d is not batching.not_mapped}
   ref, *flat_idxs = batched_args
   ref_dim, *flat_idx_dims = batched_dims
+  base_transforms = ()
+  ref_shape = ref.shape
+  from jax._src.state.types import TransformedRef
+  if isinstance(ref, TransformedRef):
+    base_transforms, ref = ref.transforms, ref.ref
   indexers = tree_util.tree_unflatten(tree, flat_idxs)
   if not indexers:
+    if base_transforms:
+      flat_all, tree = tree_util.tree_flatten(base_transforms)
+      return get_p.bind(ref, *flat_all, tree=tree), ref_dim
     return get_p.bind(ref, *flat_idxs, tree=tree), ref_dim
   indexers_dims = tree_util.tree_unflatten(tree, flat_idx_dims)
 
@@ -808,9 +816,10 @@ def _get_vmap(batched_args, batched_dims, *, tree):
 
   # TODO(sharadmv): handle vmap of multiple indexers
   new_indexers = tuple(_batch_indexer(indexer, dims, axis_size,
-                                  ref.shape, ref_dim, idx_is_batched)
+                                  ref_shape, ref_dim, idx_is_batched)
                      for indexer, dims in zip(indexers, indexers_dims))
-  flat_indexers, tree = tree_util.tree_flatten(new_indexers)
+  all_transforms = base_transforms + new_indexers
+  flat_indexers, tree = tree_util.tree_flatten(all_transforms)
 
   is_int_indexing, _, _ = indexing.unpack_ndindexer(indexers[0])
   int_indexers_contiguous = bool(
@@ -868,6 +877,11 @@ batching.primitive_batchers[get_p] = _get_vmap
 def _swap_vmap(axis_data, batched_args, batched_dims, *, tree):
   ref, val, *flat_idxs = batched_args
   ref_dim, val_dim, *flat_idx_dims = batched_dims
+  base_transforms = ()
+  ref_shape = ref.shape
+  from jax._src.state.types import TransformedRef
+  if isinstance(ref, TransformedRef):
+    base_transforms, ref = ref.transforms, ref.ref
   indexers = tree_util.tree_unflatten(tree, flat_idxs)
   indexers_dims = tree_util.tree_unflatten(tree, flat_idx_dims)
 
@@ -885,14 +899,18 @@ def _swap_vmap(axis_data, batched_args, batched_dims, *, tree):
     if ref_is_batched and not val_is_batched:
       val = batching.broadcast(val, axis_data.size, ref_dim,
                                axis_data.explicit_mesh_axis)
+    if base_transforms:
+      flat_all, new_tree = tree_util.tree_flatten(base_transforms)
+      return swap_p.bind(ref, val, *flat_all, tree=new_tree), ref_dim
     return swap_p.bind(ref, val, *flat_idxs, tree=tree), ref_dim
   if len(indexers) > 1:
     raise NotImplementedError("Batching with multiple indexers not supported.")
   # TODO(sharadmv): handle vmap of multiple indexers
   new_indexers = tuple(_batch_indexer(indexer, dims, axis_data.size,
-                                  ref.shape, ref_dim, idx_is_batched)
+                                  ref_shape, ref_dim, idx_is_batched)
                      for indexer, dims in zip(indexers, indexers_dims))
-  flat_indexers, tree = tree_util.tree_flatten(new_indexers)
+  all_transforms = base_transforms + new_indexers
+  flat_indexers, tree = tree_util.tree_flatten(all_transforms)
 
   is_int_indexing, _, _ = indexing.unpack_ndindexer(indexers[0])
   int_indexers_contiguous = bool(
@@ -951,6 +969,11 @@ batching.fancy_primitive_batchers[swap_p] = _swap_vmap
 def _addupdate_vmap(axis_data, batched_args, batched_dims, *, tree):
   ref, val, *flat_idxs = batched_args
   ref_dim, val_dim, *flat_idx_dims = batched_dims
+  base_transforms = ()
+  ref_shape = ref.shape
+  from jax._src.state.types import TransformedRef
+  if isinstance(ref, TransformedRef):
+    base_transforms, ref = ref.transforms, ref.ref
   indexers = tree_util.tree_unflatten(tree, flat_idxs)
   indexers_dims = tree_util.tree_unflatten(tree, flat_idx_dims)
 
@@ -967,15 +990,19 @@ def _addupdate_vmap(axis_data, batched_args, batched_dims, *, tree):
   if not indexers:
     if val_dim != ref_dim:
       val = batching.matchaxis2(axis_data, val_dim, ref_dim, val)
+    if base_transforms:
+      flat_all, new_tree = tree_util.tree_flatten(base_transforms)
+      return addupdate_p.bind(ref, val, *flat_all, tree=new_tree), []
     return addupdate_p.bind(ref, val, *flat_idxs, tree=tree), []
   if len(indexers) > 1:
     raise NotImplementedError("Batching with multiple indexers not supported.")
 
   # TODO(sharadmv): handle vmap of multiple indexers
   new_indexers = tuple(_batch_indexer(indexer, dims, axis_data.size,
-                                  ref.shape, ref_dim, idx_is_batched)
+                                  ref_shape, ref_dim, idx_is_batched)
                      for indexer, dims in zip(indexers, indexers_dims))
-  flat_indexers, tree = tree_util.tree_flatten(new_indexers)
+  all_transforms = base_transforms + new_indexers
+  flat_indexers, tree = tree_util.tree_flatten(all_transforms)
 
   is_int_indexing, _, _ = indexing.unpack_ndindexer(indexers[0])
   int_indexers_contiguous = bool(

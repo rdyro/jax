@@ -2513,6 +2513,7 @@ def ragged_dot(
     precision: PrecisionLike = None,
     preferred_element_type: DTypeLike | None = None,
     group_offset: Array | None = None,
+    out_sharding: NamedSharding | P | None = None,
     ) -> Array:
   """Ragged matrix multiplication.
 
@@ -2535,6 +2536,7 @@ def ragged_dot(
       precision=canonicalize_precision(precision),
       preferred_element_type=preferred_element_type,
       group_offset=group_offset,
+      out_sharding=out_sharding,
   )
 
 
@@ -2592,6 +2594,7 @@ def ragged_dot_general(
     precision: PrecisionLike = None,
     preferred_element_type: DTypeLike | None = None,
     group_offset: Array | None = None,
+    out_sharding: NamedSharding | P | None = None,
 ) -> Array:
   """Ragged matrix multiplication.
 
@@ -2645,6 +2648,7 @@ def ragged_dot_general(
       precision=canonicalize_precision(precision),
       preferred_element_type=preferred_element_type,
       group_offset=group_offset,
+      out_sharding=out_sharding,
   )
 
 
@@ -5866,7 +5870,8 @@ def _ragged_dot_general_shape_rule(
     ragged_dot_dimension_numbers,
     precision,
     preferred_element_type: DTypeLike | None,
-    **_,
+    group_offset,
+    out_sharding,
 ):
   def _check_in_range(dim, rank, dim_name, arg_name):
     if dim < 0 or dim >= rank:
@@ -5952,10 +5957,12 @@ def _ragged_dot_general_dtype_rule(
     lhs: Array,
     rhs: Array,
     group_sizes: Array,
+    *,
     ragged_dot_dimension_numbers: RaggedDotDimensionNumbers,
     precision,
     preferred_element_type: DTypeLike | None,
-    **_,
+    group_offset,
+    out_sharding,
 ) -> np.dtype:
   if not dtypes.issubdtype(group_sizes.dtype, np.integer):
     raise TypeError(
@@ -5976,7 +5983,7 @@ def _ragged_dot_general_dtype_rule(
 
 def _ragged_dot_general_jvp_rule(
     primals, tangents, ragged_dot_dimension_numbers,
-    precision, preferred_element_type, group_offset
+    precision, preferred_element_type, group_offset, out_sharding
 ):
   # note - we could ostensibly just get this by passing on the
   # value to ragged_dot below, but, this feels cleaner.
@@ -6156,7 +6163,8 @@ def _ragged_dot_general_batch_rule(
     ragged_dot_dimension_numbers,
     precision,
     preferred_element_type: DTypeLike | None,
-    **_,
+    group_offset,
+    out_sharding,
 ):
   invoke = partial(_ragged_dot_general_invoke_prim, batched_args[2])
   batched_out, result_batch_dim = _dot_batch_rule(
@@ -6177,11 +6185,20 @@ def _ragged_dot_general_batch_rule(
   return batched_out, result_batch_dim
 
 
+def _ragged_dot_general_sharding_rule(
+    lhs, rhs, group_sizes, *, ragged_dot_dimension_numbers, precision,
+    preferred_element_type: DTypeLike | None, group_offset, out_sharding):
+  if out_sharding is not None:
+    return out_sharding
+  raise NotImplementedError
+
+
 ragged_dot_general_p = standard_primitive(
     _ragged_dot_general_shape_rule,
     _ragged_dot_general_dtype_rule,
     'ragged_dot_general',
-    vma_rule=partial(core.standard_vma_rule, 'ragged_dot')
+    vma_rule=partial(core.standard_vma_rule, 'ragged_dot'),
+    sharding_rule=_ragged_dot_general_sharding_rule,
 )
 ad.primitive_jvps[ragged_dot_general_p] = _ragged_dot_general_jvp_rule
 ad.primitive_transposes[ragged_dot_general_p] = _ragged_dot_general_transpose_rule
@@ -6196,6 +6213,7 @@ def _ragged_dot_general_impl(
     precision: PrecisionLike = None,
     preferred_element_type: DTypeLike | None = None,
     group_offset: Array | None = None,
+    out_sharding: NamedSharding | P | None = None,
     ) -> Array:
   if group_offset is not None:
     raise NotImplementedError("Unimplemented group_offset support.")
@@ -6301,6 +6319,7 @@ def _ragged_dot_general_lower(
     precision,
     preferred_element_type: np.dtype | None,
     group_offset: Array | None = None,
+    out_sharding,
     platform: str = 'default',
 ):
   if group_offset is not None:

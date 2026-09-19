@@ -2368,10 +2368,15 @@ class PushBlockSpecTest(parameterized.TestCase):
 
     x_type = jax.ShapeDtypeStruct((512,), jnp.float32)
     block_spec = pl.BlockSpec((128,), lambda i: (i,))
-    with self.assertRaisesRegex(
-        NotImplementedError, 'concatenate not supported yet'
-    ):
-      block_spec_lib.push_block_spec(f, block_spec, block_spec)(x_type, x_type)
+    # Partial blocks: each grid step writes one block per child.
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec, block_spec)(
+        x_type, x_type
+    )
+    self.assertIsInstance(out_block_spec, block_spec_lib.MultiBlockSpec)
+    self.assertEqual(
+        [bs.index_map(3) for bs in out_block_spec.specs], [(3,), (7,)])
+    self.assertEqual(
+        [bs.index_map(3) for bs in out_block_spec.child_specs], [(3,), (3,)])
     x_type = jax.ShapeDtypeStruct((512,), jnp.float32)
     block_spec = pl.BlockSpec((512,), lambda i: (i,))
     out_block_spec = block_spec_lib.push_block_spec(f, block_spec, block_spec)(

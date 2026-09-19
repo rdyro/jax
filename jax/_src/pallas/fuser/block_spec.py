@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 import contextlib
 import dataclasses
+import itertools
 import enum
 import functools
 import threading
@@ -66,10 +67,55 @@ def _null_block_index_trafo(*block_indices):
   return None
 
 
+@dataclasses.dataclass(frozen=True)
+class BlockSelect:
+  """Marks a block as only needed when ``select_fn(*idxs) == child``.
+
+  Produced by partial-block concatenation: each child of a concat gets one
+  entry, all children of the same concat share ``group``. Kernels can use this
+  to only fetch the child that a grid step actually reads.
+  """
+  group: int
+  child: int
+  num_children: int
+  select_fn: Callable[..., Any]
+
+
+@dataclasses.dataclass
+class SelectiveBlockSpec(pallas_core.BlockSpec):
+  """A ``BlockSpec`` that is only needed for some grid steps."""
+  select: tuple[BlockSelect, ...] = ()
+
+
+@dataclasses.dataclass
+class MultiBlockSpec:
+  """An output written as several blocks per grid step (partial-block concat).
+
+  ``specs`` are the (offset) destination specs of each child in the output
+  array, ``child_specs`` the children's own specs (used to pull the fusion).
+  """
+  specs: tuple[pallas_core.BlockSpec, ...]
+  child_specs: tuple[pallas_core.BlockSpec, ...]
+  index_map: Any = None
+
+
+_select_group_ids = itertools.count()
+
+
+class _Unfetched:
+  """Kernel-side marker for a block the kernel chose not to fetch."""
+  def __repr__(self):
+    return "UNFETCHED"
+
+
+UNFETCHED = _Unfetched()
+
+
 @dataclasses.dataclass
 class BlockIndexTransform:
   block_shape: Sequence[pallas_core.BlockDim | int | None] | None
   block_index_transform: Callable[..., Any] = _null_block_index_trafo
+  select: tuple[BlockSelect, ...] = dataclasses.field(kw_only=True, default=())
   # NOTE(levskaya): for "terminal" transforms to mark MemorySpace.KEY
   # there are no propagation rules for this.
   memory_space: Any | None = dataclasses.field(kw_only=True, default=None)
@@ -174,11 +220,32 @@ def _apply_block_transform(
         "Seed block specs with differing types or backend-specific attributes "
         f"are not supported: {valid_block_specs}"
     )
-  return valid_block_specs[0].replace(
+  new_block_spec = valid_block_specs[0].replace(
       block_shape=block_index_transform.block_shape,
       index_map=make_new_idx_map(block_index_transform),
       memory_space=block_index_transform.memory_space,
       pipeline_mode=block_index_transform.pipeline_mode,
+  )
+  if not block_index_transform.select:
+    return new_block_spec
+  if type(new_block_spec) is not pallas_core.BlockSpec:
+    raise NotImplementedError(
+        f"Partial-block concat with {type(new_block_spec)} seed not supported")
+
+  def make_select_fn(select_fn):
+    def new_select_fn(*args):
+      block_indices = tuple(
+          None if bs is pallas_core.no_block_spec else bs.index_map(*args)
+          for bs in block_specs
+      )
+      return select_fn(*block_indices)
+    return new_select_fn
+
+  return SelectiveBlockSpec(
+      **{f.name: getattr(new_block_spec, f.name)
+         for f in dataclasses.fields(new_block_spec)},
+      select=tuple(dataclasses.replace(sel, select_fn=make_select_fn(sel.select_fn))
+                   for sel in block_index_transform.select),
   )
 
 
@@ -376,6 +443,11 @@ def _wrap_block_spec_scalar_prefetch(
     block_spec: pallas_core.BlockSpec,
     num_grid_args: int | None,
 ) -> pallas_core.BlockSpec:
+  if isinstance(block_spec, MultiBlockSpec):
+    wrap = functools.partial(
+        _wrap_block_spec_scalar_prefetch, num_grid_args=num_grid_args)
+    return MultiBlockSpec(tuple(map(wrap, block_spec.specs)),
+                          tuple(map(wrap, block_spec.child_specs)))
   if (
       block_spec is pallas_core.no_block_spec
       or block_spec.index_map is None
@@ -383,8 +455,14 @@ def _wrap_block_spec_scalar_prefetch(
   ):
     return block_spec
 
+  kwargs = {}
+  if isinstance(block_spec, SelectiveBlockSpec):
+    kwargs["select"] = tuple(
+        dataclasses.replace(
+            sel, select_fn=_wrap_index_map(sel.select_fn, num_grid_args))
+        for sel in block_spec.select)
   return block_spec.replace(
-      index_map=_wrap_index_map(block_spec.index_map, num_grid_args)
+      index_map=_wrap_index_map(block_spec.index_map, num_grid_args), **kwargs
   )
 
 
@@ -413,6 +491,18 @@ def pull_block_spec(
         f, *args, **kwargs
     )
     del out_tree_
+    return _pull_block_spec_from_jaxpr(
+        jaxpr, consts, in_tree, out_block_specs,
+        scalar_prefetch_handler=scalar_prefetch_handler, grid_len=grid_len,
+        strict_mode=strict_mode)
+
+  return wrapped
+
+
+def _pull_block_spec_from_jaxpr(
+    jaxpr, consts, in_tree, out_block_specs, *, scalar_prefetch_handler,
+    grid_len, strict_mode):
+  if True:
     jaxpr_out_usages = [{Usage.REGULAR}] * len(jaxpr.outvars)
     block_specs_ = jax.tree.map(
         _unwrap_block_spec_scalar_prefetch, out_block_specs
@@ -454,8 +544,6 @@ def pull_block_spec(
     )
     in_block_arg_specs, in_block_kwarg_specs = in_block_specs
     return kernel_fn, in_block_arg_specs, in_block_kwarg_specs
-
-  return wrapped
 
 
 def _block_dim_equal(
@@ -727,7 +815,7 @@ def make_kernel_function(
         jaxpr.invars, flat_args, invar_usages, strict=True
     ):
       if Usage.REGULAR in usage:
-        env[invar] = arg
+        env[invar] = UNFETCHED if arg is None else arg
     for i, eqn in enumerate(jaxpr.eqns):
       outvar_usages = [
           read_usage_env(v) if not isinstance(v, core.Literal) else set()
@@ -735,6 +823,17 @@ def make_kernel_function(
       ]
       if any(Usage.REGULAR in usage for usage in outvar_usages):
         in_vals = util.safe_map(read_env, eqn.invars)
+        # ``None`` inputs mark blocks the kernel did not fetch (inactive concat
+        # children); they flow through until the concat picks the active child.
+        missing = [v is UNFETCHED for v in in_vals]
+        if any(missing) and all(
+            m or isinstance(var, core.Literal) or read_env(var) is None
+            for m, var in zip(missing, eqn.invars)):
+          util.safe_map(write_env, eqn.outvars, [UNFETCHED] * len(eqn.outvars))
+          continue
+        if any(missing) and eqn.primitive is not lax.concatenate_p:
+          raise NotImplementedError(
+              f"{eqn.primitive} mixes fetched and unfetched blocks")
         # TODO(sharadmv,justinfu): preserve source mapping
         if not (eval_rule := eval_rules.get(eqn.primitive, None)):
           raise NotImplementedError(eqn.primitive)
@@ -775,7 +874,8 @@ def make_kernel_function(
         if not eqn.primitive.multiple_results:
           outs = [outs]
         util.safe_map(write_env, eqn.outvars, outs)
-    out = util.safe_map(read_env, jaxpr.outvars)
+    out = [None if v is UNFETCHED else v
+           for v in util.safe_map(read_env, jaxpr.outvars)]
     return tree_util.tree_unflatten(out_tree, out)
 
   return kernel_fn
@@ -1777,8 +1877,15 @@ def _get_eval_rule(ctx: KernelEvalContext, ref, *idx, tree):
   return ref.get(idx=tuple(block_indexer))
 
 
-@register_eval_rule(lax.concatenate_p)
+@register_eval_rule(lax.concatenate_p, ref_polymorphic=True)
 def _concatenate_eval_rule(ctx: KernelEvalContext, *args, dimension):
+  fetched = [a for a in args if a is not UNFETCHED]
+  if len(fetched) < len(args):
+    if len(fetched) != 1:
+      raise NotImplementedError(
+          f"Expected exactly one fetched concat child, got {len(fetched)}")
+    return fetched[0]
+  args = util.safe_map(_deref, args)
   # We now handle the case where each of the concatenated array dimensions
   # divides the block size.
   block_spec = ctx.out_block_specs[0]
@@ -1877,6 +1984,11 @@ def _concatenate_rule(
     num_blocks.append(aval.shape[dimension] // block_dim)
   ends = np.cumsum(num_blocks).astype(np.int32)
   starts = np.concatenate(([0], ends[:-1])).astype(np.int32)
+  group = next(_select_group_ids)
+
+  def select_fn(*idxs):
+    block_idx = block_transform.block_index_transform(*idxs)[dimension]
+    return sum((block_idx >= int(e)) for e in ends[:-1])
 
   def make_block_transform(child_index: int):
     def new_block_index_transform(*idxs):
@@ -1893,8 +2005,10 @@ def _concatenate_rule(
       )
       return util.tuple_update(idx, dimension, block_idx)
 
+    select = BlockSelect(group, child_index, len(ctx.avals_in), select_fn)
     return block_transform.replace(
-        block_index_transform=new_block_index_transform
+        block_index_transform=new_block_index_transform,
+        select=(*block_transform.select, select),
     )
   return [make_block_transform(i) for i in range(len(ctx.avals_in))]
 
@@ -2890,6 +3004,24 @@ def push_pull_block_spec(
         return_out_type=True,
         **block_spec_kwargs,
     )(values, *args, **kwargs)
+    out_leaves = jax.tree.leaves(out_block_specs)
+    if any(isinstance(bs, MultiBlockSpec) for bs in out_leaves):
+      # Pull the children of the trailing concat with their own specs; the
+      # kernel function then returns one tile per child.
+      if len(out_leaves) != 1:
+        raise NotImplementedError('partial-block concatenate needs a single output')
+      jaxpr, consts, in_tree, _ = fuser_utils.make_jaxpr(
+          f, values, *args, **kwargs)
+      eqn = jaxpr.eqns[-1]
+      if eqn.primitive is not lax.concatenate_p or list(jaxpr.outvars) != eqn.outvars:
+        raise NotImplementedError('partial-block concatenate must be the last op')
+      jaxpr = jaxpr.replace(eqns=jaxpr.eqns[:-1], outvars=list(eqn.invars))
+      kernel_fn, (values_block_specs, *_), kwarg_block_specs = (
+          _pull_block_spec_from_jaxpr(
+              jaxpr, consts, in_tree, out_leaves[0].child_specs,
+              scalar_prefetch_handler=scalar_prefetch_handler,
+              grid_len=grid_len, strict_mode=False))
+      return kernel_fn, values_block_specs, kwarg_block_specs, out_type, out_block_specs
     kernel_fn, (values_block_specs, *_), kwarg_block_specs = pull_block_spec(
         f,
         out_block_specs,
@@ -2954,6 +3086,9 @@ def _push_block_spec_jaxpr(
     rule = push_block_spec_rules.get(eqn.primitive, None)
     if not rule:
       raise NotImplementedError(eqn.primitive)
+    if any(isinstance(bs, MultiBlockSpec) for bs in in_block_specs):
+      raise NotImplementedError(
+          f'{eqn.primitive} after a partial-block concatenate is not supported')
     ctx = PushRuleContext(
         avals_in=tuple(v.aval for v in eqn.invars),
         avals_out=tuple(v.aval for v in eqn.outvars),
@@ -3395,14 +3530,35 @@ def _concatenate_push_rule(
       pallas_core._canonicalize_block_shape(block_spec.block_shape)
       for block_spec in block_specs
   ]
-  # We only support concatenation if the entirety of the concat dimension is blocked.
   assert all(hasattr(aval_in, 'shape') for aval_in in avals_in)
   if not all(
       block_shape[dimension] == pallas_core.Blocked(avals_in.shape[dimension])
       for block_shape, avals_in in zip(block_shapes, avals_in)
   ):
-    raise NotImplementedError(
-        f'concatenate not supported yet: {block_shapes=}, {avals_in=}'
+    # Partial blocks: every grid step writes one block per child, each at its
+    # own offset in the output. Children must share blocking and index maps.
+    block_dim = pallas_core.get_block_size(block_shapes[0][dimension])
+    if not all(
+        bs == block_shapes[0] and aval.shape[dimension] % block_dim == 0
+        for bs, aval in zip(block_shapes, avals_in)
+    ) or not all(bs.index_map == block_specs[0].index_map for bs in block_specs):
+      raise NotImplementedError(
+          f'concatenate not supported yet: {block_shapes=}, {avals_in=}'
+      )
+    starts = np.cumsum([0, *(aval.shape[dimension] for aval in avals_in[:-1])])
+
+    def offset_index_map(index_map, offset):
+      def new_index_map(*args):
+        return util.tuple_update(
+            tuple(index_map(*args)), dimension,
+            index_map(*args)[dimension] + int(offset))
+      return new_index_map
+
+    return MultiBlockSpec(
+        specs=tuple(
+            bs.replace(index_map=offset_index_map(bs.index_map, start // block_dim))
+            for bs, start in zip(block_specs, starts)),
+        child_specs=tuple(block_specs),
     )
   def _new_index_map(*args):
     all_indices = [block_spec.index_map(*args) for block_spec in block_specs]

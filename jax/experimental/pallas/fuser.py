@@ -22,6 +22,9 @@ from jax._src.pallas.fuser.block_spec import pull_block_spec as pull_block_spec
 from jax._src.pallas.fuser.block_spec import push_block_spec as push_block_spec
 from jax._src.pallas.fuser.block_spec import push_pull_block_spec as push_pull_block_spec
 from jax._src.pallas.fuser.block_spec import BlockIndexTransform as BlockIndexTransform
+from jax._src.pallas.fuser.block_spec import BlockSelect as BlockSelect
+from jax._src.pallas.fuser.block_spec import MultiBlockSpec as MultiBlockSpec
+from jax._src.pallas.fuser.block_spec import SelectiveBlockSpec as SelectiveBlockSpec
 from jax._src.pallas.fuser.custom_fusion_lib import custom_fusion as custom_fusion
 from jax._src.pallas.fuser.custom_evaluate import evaluate as evaluate
 from jax._src.pallas.fuser.fusible import fusible as fusible

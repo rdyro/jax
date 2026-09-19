@@ -2363,6 +2363,40 @@ def _slice_lowering_rule_wg(
   )
 
 
+@register_lowering_rule(lax.split_p, mgpu.LoweringSemantics.Lane)
+def _split_lowering_rule(ctx: LoweringRuleContext, x, *, sizes, axis):
+  results = []
+  offset = 0
+  for size in sizes:
+    slc = [slice(None)] * x.ndim
+    slc[axis] = slice(offset, offset + size)
+    results.append(x[tuple(slc)])
+    offset += size
+  return tuple(results)
+
+
+@register_lowering_rule(lax.split_p, mgpu.LoweringSemantics.Warpgroup)
+def _split_lowering_rule_wg(ctx: LoweringRuleContext, x, *, sizes, axis):
+  x_val = _ensure_ir_value(x, ctx.avals_in[0].dtype)
+  assert isinstance(x_val.type, ir.VectorType)
+  elem_ty = ir.VectorType(x_val.type).element_type
+  in_shape = list(ir.VectorType(x_val.type).shape)
+  results = []
+  offset = 0
+  for size in sizes:
+    out_shape = list(in_shape)
+    out_shape[axis] = size
+    out_ty = ir.VectorType.get(out_shape, elem_ty)
+    start_indices = [0] * len(in_shape)
+    start_indices[axis] = offset
+    strides = [1] * len(in_shape)
+    results.append(vector_dialect.extract_strided_slice(
+        out_ty, x_val, start_indices, out_shape, strides
+    ))
+    offset += size
+  return tuple(results)
+
+
 @register_lowering_rule(lax.concatenate_p, mgpu.LoweringSemantics.Lane)
 def _concatenate_lowering_rule(ctx: LoweringRuleContext, *args, dimension):
   arrays = [_ensure_fa(x, aval.dtype) for x, aval in zip(args, ctx.avals_in)]

@@ -49,6 +49,7 @@ from jax._src.pallas import utils as pallas_utils
 from jax._src.pallas.fuser import fuser_utils
 from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
+from jax._src.state import types as state_types
 from jax._src.traceback_util import api_boundary
 import jax.numpy as jnp
 import numpy as np
@@ -162,6 +163,17 @@ def _apply_block_transform(
       bs for bs in block_specs if bs is not pallas_core.no_block_spec
   ]
   assert len(valid_block_specs) >= 1
+  # Pulled specs inherit the class and any backend-specific attributes (e.g.
+  # ``transforms`` on a Mosaic GPU BlockSpec) from the first seed.
+  core_fields = {"block_shape", "index_map", "memory_space", "pipeline_mode"}
+  def _extra_attrs(bs):
+    return (type(bs), tuple((f.name, getattr(bs, f.name)) for f in dataclasses.fields(bs)
+                            if f.name not in core_fields))
+  if any(_extra_attrs(bs) != _extra_attrs(valid_block_specs[0]) for bs in valid_block_specs[1:]):
+    raise NotImplementedError(
+        "Seed block specs with differing types or backend-specific attributes "
+        f"are not supported: {valid_block_specs}"
+    )
   return valid_block_specs[0].replace(
       block_shape=block_index_transform.block_shape,
       index_map=make_new_idx_map(block_index_transform),
@@ -757,6 +769,8 @@ def make_kernel_function(
             grid_len=grid_len,
             out_usages=out_usages,
         )
+        if eqn.primitive not in ref_polymorphic_prims:
+          in_vals = util.safe_map(_deref, in_vals)
         outs = eval_rule(eval_ctx, *in_vals, **eqn.params)
         if not eqn.primitive.multiple_results:
           outs = [outs]
@@ -921,15 +935,30 @@ class EvalRuleFn(Protocol):
 
 
 eval_rules: dict[core.Primitive, EvalRuleFn] = {}
+# Eval rules that accept ``Ref``s (e.g. SMEM tiles) as inputs and may return
+# (transformed) ``Ref``s. All other rules receive dereferenced values.
+ref_polymorphic_prims: set[core.Primitive] = set()
+
+
+def _is_ref(x) -> bool:
+  return isinstance(x, state_types.TransformedRef) or isinstance(
+      getattr(x, 'aval', None), state_types.AbstractRef
+  )
+
+
+def _deref(x):
+  return x[...] if _is_ref(x) else x
 
 
 def register_eval_rule(
-    prim: core.Primitive,
+    prim: core.Primitive, *, ref_polymorphic: bool = False
 ) -> Callable[[Any], EvalRuleFn]:
   def wrapper(
       f: EvalRuleFn,
   ) -> EvalRuleFn:
     eval_rules[prim] = f
+    if ref_polymorphic:
+      ref_polymorphic_prims.add(prim)
     return f
 
   return wrapper
@@ -1146,7 +1175,7 @@ def _clamp_pull_block_spec_rule(
   return [min_block_transform, block_transform, max_block_transform]
 
 
-@register_eval_rule(lax.squeeze_p)
+@register_eval_rule(lax.squeeze_p, ref_polymorphic=True)
 def _squeeze_eval_rule(ctx: KernelEvalContext, x: jax.Array, **params: Any):
   del ctx, params
   return x
@@ -1180,7 +1209,7 @@ def _squeeze_block_spec(
   )]
 
 
-@register_eval_rule(lax.slice_p)
+@register_eval_rule(lax.slice_p, ref_polymorphic=True)
 def _slice_eval_rule(ctx, x, **params):
   del params
   out_block_shape = ctx.out_block_specs[0].block_shape
@@ -1366,7 +1395,7 @@ def _dynamic_slice_usage_rule(ctx, used_out: set[Usage], **params):
     return [set()] * len(ctx.avals_in)
 
 
-@register_eval_rule(lax.dynamic_slice_p)
+@register_eval_rule(lax.dynamic_slice_p, ref_polymorphic=True)
 def _dynamic_slice_eval_rule(ctx, x, *args, **params):
   del ctx, params
   return x
@@ -1443,7 +1472,7 @@ def _dynamic_update_slice_usage_rule(ctx, used_out: set[Usage], **params):
     return [set()] * len(ctx.avals_in)
 
 
-@register_eval_rule(lax.dynamic_update_slice_p)
+@register_eval_rule(lax.dynamic_update_slice_p, ref_polymorphic=True)
 def _dynamic_update_slice_eval_rule(
     ctx, operand, update, *start_indices, **params
 ):
@@ -1579,7 +1608,7 @@ def _swap_pull_rule(
   return [block_transform, block_transform]
 
 
-@register_eval_rule(state_primitives.swap_p)
+@register_eval_rule(state_primitives.swap_p, ref_polymorphic=True)
 def _swap_eval_rule(ctx: KernelEvalContext, ref, val, *idx, tree):
   indexers = tree_util.tree_unflatten(tree, idx)
   ref_aval, _ = ctx.avals_in[:2]
@@ -1685,7 +1714,7 @@ def _get_pull_rule(
           + [no_block_index_transform] * (len(ctx.avals_in) - 1))
 
 
-@register_eval_rule(state_primitives.get_p)
+@register_eval_rule(state_primitives.get_p, ref_polymorphic=True)
 def _get_eval_rule(ctx: KernelEvalContext, ref, *idx, tree):
   indexers = tree_util.tree_unflatten(tree, idx)
   ref_aval = ctx.avals_in[0]
@@ -2000,7 +2029,7 @@ def _broadcast_in_dim_usage_rule(ctx, used_out: set[Usage], **params):
     return [set()]
 
 
-@register_eval_rule(lax.broadcast_in_dim_p)
+@register_eval_rule(lax.broadcast_in_dim_p, ref_polymorphic=True)
 def _broadcast_in_dim_eval_rule(
     eval_ctx: KernelEvalContext, x, broadcast_dimensions, shape, **params
 ):
@@ -2016,7 +2045,9 @@ def _broadcast_in_dim_eval_rule(
       if shape[d] is not None
   )
   shape = tuple(s for s in shape if s is not None)
-  return jax.lax.broadcast_in_dim(x, broadcast_dimensions=dims, shape=shape)
+  return jax.lax.broadcast_in_dim(
+      _deref(x), broadcast_dimensions=dims, shape=shape
+  )
 
 
 @register_pull_block_spec_rule(lax.broadcast_in_dim_p)
@@ -2050,7 +2081,7 @@ def _broadcast_in_dim_pull_rule(
       block_index_transform=new_block_index_transform)]
 
 
-@register_eval_rule(lax.transpose_p)
+@register_eval_rule(lax.transpose_p, ref_polymorphic=True)
 def _transpose_eval_rule(
     eval_ctx: KernelEvalContext, x, permutation: tuple[int, ...]
 ):
@@ -2070,7 +2101,9 @@ def _transpose_eval_rule(
   ]
   assert next(block_dims_iter, None) is None
   permuted_block_dims = [expanded_block_dims[p] for p in permutation]
-  new_permutation = [p for p in permuted_block_dims if p is not None]
+  new_permutation = tuple(p for p in permuted_block_dims if p is not None)
+  if _is_ref(x):
+    return x.transpose(new_permutation)
   return jax.lax.transpose(x, permutation=new_permutation)
 
 
@@ -2101,11 +2134,15 @@ def _transpose_pull_rule(
       block_index_transform=new_block_index_transform)]
 
 
-@register_eval_rule(lax.split_p)
+@register_eval_rule(lax.split_p, ref_polymorphic=True)
 def _split_eval_rule(
     eval_ctx: KernelEvalContext, x, sizes: Sequence[int], axis: int
 ):
   del eval_ctx
+  if _is_ref(x):
+    starts = np.cumsum([0, *sizes[:-1]])
+    return [x.at[(slice(None),) * axis + (indexing.ds(int(s), int(n)),)]
+            for s, n in zip(starts, sizes)]
   return lax.split(x, sizes=sizes, axis=axis)
 
 
@@ -2204,9 +2241,11 @@ def _convert_element_type_pull_rule(
   return [block_transform]
 
 
-@register_eval_rule(lax.bitcast_convert_type_p)
+@register_eval_rule(lax.bitcast_convert_type_p, ref_polymorphic=True)
 def _bitcast_convert_type_eval_rule(eval_ctx: KernelEvalContext, x, new_dtype):
   del eval_ctx
+  if _is_ref(x):
+    return x.bitcast(new_dtype)
   return jax.lax.bitcast_convert_type(x, new_dtype)
 
 
@@ -2484,7 +2523,7 @@ def _reshape_pull_rule(
   raise NotImplementedError(f'reshape not supported yet: {aval_in}, {aval_out}')
 
 
-@register_eval_rule(lax.reshape_p)
+@register_eval_rule(lax.reshape_p, ref_polymorphic=True)
 def _reshape_eval_rule(
     eval_ctx: KernelEvalContext, x, *, dimensions, new_sizes, sharding
 ):
@@ -2572,7 +2611,7 @@ def _jit_usage_rule(
   return in_usages
 
 
-@register_eval_rule(pjit.jit_p)
+@register_eval_rule(pjit.jit_p, ref_polymorphic=True)
 def _jit_eval_rule(ctx: KernelEvalContext, *args, jaxpr, **kwargs):
   jaxpr, consts = jaxpr, jaxpr.consts
   if consts:
@@ -2636,7 +2675,7 @@ def _custom_jvp_call_usage_rule(
   return in_usages
 
 
-@register_eval_rule(custom_derivatives.custom_jvp_call_p)
+@register_eval_rule(custom_derivatives.custom_jvp_call_p, ref_polymorphic=True)
 def _custom_jvp_call_eval_rule(
     ctx: KernelEvalContext, *args, call_jaxpr: core.Jaxpr, **kwargs
 ):
@@ -2702,7 +2741,7 @@ def _custom_vjp_call_usage_rule(
   return in_usages
 
 
-@register_eval_rule(custom_derivatives.custom_vjp_call_p)
+@register_eval_rule(custom_derivatives.custom_vjp_call_p, ref_polymorphic=True)
 def _custom_vjp_call_eval_rule(
     ctx: KernelEvalContext, *args, call_jaxpr: core.Jaxpr, **kwargs
 ):
@@ -2769,7 +2808,7 @@ def _custom_call_hi_primitive_pull_block_spec_rule(
   return _prim.pull_block_spec_rule(ctx, out_block_specs)
 
 
-@register_eval_rule(hijax.call_hi_primitive_p)
+@register_eval_rule(hijax.call_hi_primitive_p, ref_polymorphic=True)
 def _custom_call_hi_primitive_eval_rule(
     ctx: KernelEvalContext, *args, _prim
 ):

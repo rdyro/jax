@@ -13,3 +13,6 @@
 # limitations under the License.
 
 from jaxlib.triton import dialect  # noqa: F401
+
+def register_compilation_handler(*args, **kwargs):
+  pass

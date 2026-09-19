@@ -47,6 +47,7 @@ from jax._src.lib.mlir.dialects import gpu as gpu_dialect
 from jax._src.lib.mlir.dialects import llvm as llvm_dialect
 from jax._src.lib.mlir.dialects import vector as vector_dialect
 from jax._src.pallas import core as pallas_core
+from jax._src.pallas import helpers as pallas_helpers
 from jax._src.pallas import primitives as pallas_primitives
 from jax._src.pallas import utils as pallas_utils
 from jax._src.pallas.mosaic_gpu import core as gpu_core
@@ -1206,6 +1207,49 @@ def _copy_gmem_to_smem_lowering(
   )
   return ()
 
+def _resolve_concat_view(ref):
+  """Resolves ``concat_ref(...).at[slices]`` to ``[(predicate, child_view)]``.
+
+  Returns ``None`` if ``ref`` is not a sliced concat view. The slice along the
+  concat axis must fall within a single child; with a static start this is
+  checked at trace time, with a dynamic start it is the caller's promise and
+  one predicated copy per child is emitted.
+  """
+  if not (isinstance(ref, state_types.TransformedRef)
+          and isinstance(ref.ref, state_types.TransformedRef)
+          and ref.ref.multiref
+          and isinstance(ref.ref.transforms[0], state_types.ConcatTransform)):
+    return None
+  concat, children = ref.ref.transforms[0], ref.ref.ref
+  if not ref.transforms or not isinstance(ref.transforms[0], indexing.NDIndexer):
+    raise NotImplementedError("concat_ref must be sliced before copying")
+  indexer, *rest = ref.transforms
+  idx = indexer.indices[concat.axis]
+  if not isinstance(idx, indexing.Slice) or idx.stride != 1:
+    raise NotImplementedError(f"Unsupported index into concat_ref: {idx}")
+  offsets = np.cumsum([0, *concat.sizes[:-1]])
+  if any(size % idx.size for size in concat.sizes):
+    raise ValueError(
+        f"Slice size {idx.size} must divide every child size {concat.sizes}")
+
+  def child_view(i, start):
+    indices = util.tuple_update(
+        indexer.indices, concat.axis, indexing.Slice(start, idx.size))
+    child_indexer = indexing.NDIndexer(indices, children[i].shape, indexer.int_indexer_shape)
+    return state_types.TransformedRef(children[i], (child_indexer, *rest))
+
+  if isinstance(idx.start, int):
+    i = int(np.searchsorted(offsets, idx.start, side="right") - 1)
+    if idx.start + idx.size > offsets[i] + concat.sizes[i]:
+      raise ValueError(f"Slice {idx} crosses a concat_ref child boundary")
+    return [(None, child_view(i, idx.start - int(offsets[i])))]
+  return [
+      ((idx.start >= int(off)) & (idx.start < int(off + size)),
+       child_view(i, idx.start - int(off)))
+      for i, (off, size) in enumerate(zip(offsets, concat.sizes))
+  ]
+
+
 def copy_gmem_to_smem(
     src: _Ref,
     dst: _Ref,
@@ -1272,6 +1316,20 @@ def copy_gmem_to_smem(
     :func:`jax.experimental.pallas.mosaic_gpu.barrier_wait`
     :func:`jax.experimental.pallas.mosaic_gpu.wait_gmem_to_smem`
   """
+  if (children := _resolve_concat_view(src)) is not None:
+    # A sliced ``pl.concat_ref`` view: copy from the one child the slice falls
+    # in. Static starts pick the child at trace time; dynamic starts branch.
+    copy = functools.partial(
+        copy_gmem_to_smem, dst=dst, barrier=barrier,
+        collective_axes=collective_axes, leader_tracked=leader_tracked,
+        oob_mode=oob_mode)
+    for pred, child in children:
+      if pred is None:
+        copy(child, predicate=predicate)
+      else:
+        pallas_helpers.when(pred if predicate is None else pred & predicate)(
+            lambda child=child: copy(child))
+    return
   src, src_transforms = state_primitives.get_ref_and_transforms(
       src, None, "copy_gmem_to_smem"
   )

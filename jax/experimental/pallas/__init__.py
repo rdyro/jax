@@ -48,6 +48,7 @@ from jax._src.pallas.helpers import empty_like as empty_like
 from jax._src.pallas.helpers import empty_ref_like as empty_ref_like
 from jax._src.pallas.helpers import kernel as kernel
 from jax._src.pallas.helpers import loop as loop
+from jax._src.pallas.helpers import concat_ref as concat_ref
 from jax._src.pallas.helpers import select_ref as select_ref
 from jax._src.pallas.helpers import when as when
 from jax._src.pallas.helpers import with_scoped as with_scoped

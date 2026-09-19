@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 import contextlib
+import collections
 import dataclasses
 import enum
 import functools
@@ -781,6 +782,74 @@ def make_kernel_function(
   return kernel_fn
 
 
+@tree_util.register_pytree_node_class
+@dataclasses.dataclass(frozen=True)
+class ConcatRefs:
+  """Fusion inputs that are only ever concatenated along ``axis``.
+
+  ``get_fusion_values`` groups such inputs into one value of the concatenated
+  type. Kernels should view the group as a single ref with
+  ``pl.concat_ref(*group.refs, axis=group.axis)`` before pipelining it, so
+  that only the child a block falls in is fetched.
+  """
+  refs: tuple[Any, ...]
+  axis: int
+
+  @property
+  def type(self):
+    shape = list(self.refs[0].shape)
+    shape[self.axis] = sum(r.shape[self.axis] for r in self.refs)
+    return jax.ShapeDtypeStruct(tuple(shape), self.refs[0].dtype)
+
+  shape = property(lambda self: self.type.shape)
+  dtype = property(lambda self: self.type.dtype)
+  ndim = property(lambda self: len(self.shape))
+
+  def tree_flatten(self):
+    return self.refs, self.axis
+
+  @classmethod
+  def tree_unflatten(cls, axis, refs):
+    return cls(tuple(refs), axis)
+
+
+def _group_concat_inputs(jaxpr: core.Jaxpr, values):
+  """Replaces ``concatenate(*consts)`` with a single const of ``ConcatRefs``."""
+  const_idx = {v: i for i, v in enumerate(jaxpr.constvars)}
+  uses = collections.Counter(
+      v for eqn in jaxpr.eqns for v in eqn.invars if isinstance(v, core.Var))
+  uses.update(v for v in jaxpr.outvars if isinstance(v, core.Var))
+  subst, new_consts, new_values, eqns = {}, list(jaxpr.constvars), list(values), []
+  for eqn in jaxpr.eqns:
+    if (eqn.primitive is lax.concatenate_p
+        and all(isinstance(v, core.Var) and v in const_idx and uses[v] == 1
+                for v in eqn.invars)
+        and not isinstance(jax.typeof(values[const_idx[eqn.invars[0]]]),
+                           state_types.AbstractRef)):
+      idxs = [const_idx[v] for v in eqn.invars]
+      new_var = core.Var(eqn.outvars[0].aval)
+      subst[eqn.outvars[0]] = new_var
+      new_consts[idxs[0]] = new_var
+      new_values[idxs[0]] = ConcatRefs(
+          tuple(values[i] for i in idxs), eqn.params['dimension'])
+      for i in idxs[1:]:
+        new_consts[i] = new_values[i] = None
+      continue
+    eqns.append(eqn.replace(
+        invars=[subst.get(v, v) if isinstance(v, core.Var) else v
+                for v in eqn.invars]))
+  if not subst:
+    return jaxpr, values
+  new_values = [v for v in new_values if v is not None]
+  jaxpr = jaxpr.replace(
+      constvars=[v for v in new_consts if v is not None],
+      consts=tuple(new_values),
+      eqns=eqns,
+      outvars=[subst.get(v, v) if isinstance(v, core.Var) else v
+               for v in jaxpr.outvars])
+  return jaxpr, new_values
+
+
 @functools.partial(api_boundary, repro_api_name="fuser.get_fusion_values")
 def get_fusion_values(
     fusion: Callable, *args, **kwargs
@@ -839,6 +908,8 @@ def _get_fusion_values(
     jaxpr, used_consts, output_input_aliases = fuser_utils.discharge_state(
         jaxpr, allow_additional_outputs=allow_additional_outputs, dce=True)
     values = [v for used, v in zip(used_consts, values, strict=True) if used]
+  if not output_input_aliases:
+    jaxpr, values = _group_concat_inputs(jaxpr, values)
 
   out_usages = tuple({Usage.REGULAR} for _ in jaxpr.outvars)
   read_usage_env = compute_usage(jaxpr, out_usages)

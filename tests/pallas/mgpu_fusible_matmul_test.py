@@ -1,4 +1,5 @@
 """Fusible matmul on Mosaic GPU (sm_120: TMA + Ampere-style mma, no WGMMA/TMEM)."""
+import functools
 import unittest
 import jax
 from jax import lax
@@ -41,8 +42,16 @@ def _fusible_matmul(x, y, z=None, *, bm=64, bk=64, bn=64, stages=2, use_transfor
   y_fn, y_values, y_sp = fuser.get_stateful_input_fusion_values(y)
   z_fn, z_values, z_sp, z_aliases = fuser.get_stateful_output_fusion_values(z, z_type)
   sp_flat, sp_tree = jax.tree.flatten((x_sp, y_sp, z_sp))
-  # discharged fusions take the arrays the outer Refs hold, so trace with those types
-  avals = lambda vals: jax.tree.map(lambda v: getattr(jax.typeof(v), "inner_aval", jax.typeof(v)), vals)
+  # discharged fusions take the arrays the outer Refs hold, so trace with those types; a ConcatRefs group of
+  # inputs is one value of the concatenated type, viewed in-kernel as a single ref via pl.concat_ref
+  is_cat = lambda v: isinstance(v, fuser.ConcatRefs)
+  avals = lambda vals: jax.tree.map(
+    lambda v: v.type if is_cat(v) else getattr(jax.typeof(v), "inner_aval", jax.typeof(v)), vals, is_leaf=is_cat
+  )
+  as_refs = lambda vals, refs: jax.tree.map(
+    lambda v, r: pl.concat_ref(*r.refs, axis=r.axis) if is_cat(r) else r,
+    vals, jax.tree.unflatten(jax.tree.structure(vals), refs), is_leaf=is_cat,
+  )
   sp_handler = lambda i, sp: fuser.make_scalar_prefetch_handler(i) if sp else None
 
   x_seed = pl.BlockSpec((bm, bk), lambda mi, ni, ki, *_: (mi, ki))
@@ -59,13 +68,15 @@ def _fusible_matmul(x, y, z=None, *, bm=64, bk=64, bn=64, stages=2, use_transfor
   )(avals(z_values), z_type)
   z_out_leaves, z_out_specs = jax.tree.leaves(z_out_type), jax.tree.leaves(z_out_spec)
   unaliased = [i for i in range(len(z_out_leaves)) if i not in z_aliases]
-  sizes = [len(x_values), len(y_values), len(z_values), len(sp_flat)]
+  x_flat, y_flat, z_flat = (jax.tree.leaves(v) for v in (x_values, y_values, z_values))
+  sizes = [len(x_flat), len(y_flat), len(z_flat), len(sp_flat)]
 
   @plgpu.kernel(out_type=tuple(z_out_leaves[i] for i in unaliased), grid=grid[:2], grid_names=("m", "n"))
   def kernel(*refs):
     x_refs, y_refs, z_refs, sp_refs, out_refs = (
       refs[sum(sizes[:i]) : sum(sizes[: i + 1])] if i < 4 else refs[sum(sizes) :] for i in range(5)
     )
+    x_refs, y_refs, z_refs = as_refs(x_values, x_refs), as_refs(y_values, y_refs), as_refs(z_values, z_refs)
     mi, ni = lax.axis_index("m"), lax.axis_index("n")
     sp = sp_tree.unflatten([r[...] for r in sp_refs])
     # blocked values go through the TMA pipeline, unblocked ones are handed to the fusion as GMEM refs
@@ -117,7 +128,7 @@ def _fusible_matmul(x, y, z=None, *, bm=64, bk=64, bn=64, stages=2, use_transfor
       plgpu.Barrier(num_barriers=max(len(z_piped), 1)),
     )
 
-  out = kernel(*x_values, *y_values, *z_values, *sp_flat)
+  out = kernel(*x_flat, *y_flat, *z_flat, *sp_flat)
   return out[0] if len(unaliased) == 1 else out
 
 
@@ -159,17 +170,26 @@ class MgpuFusibleMatmulTest(unittest.TestCase):
     self.check(lambda x, wt: fusible_matmul(x, wt.T), lambda x, wt: x @ wt.T, self.x, wt)
     self.check(lambda xt, wt: fusible_matmul(xt.T, wt.T), lambda xt, wt: xt.T @ wt.T, xt, wt)
 
-  def test_fused_input_concat_full_dim(self):
-    x1, x2, w1, w2 = self.rand((128, 32)), self.rand((128, 32)), self.rand((64, 64)), self.rand((64, 64))
-    self.check(
-      lambda x1, x2, w1, w2: fusible_matmul(jnp.concatenate([x1, x2], 1), jnp.concatenate([w1, w2], 1), bn=128),
-      lambda x1, x2, w1, w2: jnp.concatenate([x1, x2], 1) @ jnp.concatenate([w1, w2], 1), x1, x2, w1, w2,
-    )
-    xa, xb = self.rand((64, 64)), self.rand((64, 64))
-    self.check(
-      lambda xa, xb, w: fusible_matmul(jnp.concatenate([xa, xb], 0), w, bm=128),
-      lambda xa, xb, w: jnp.concatenate([xa, xb], 0) @ w, xa, xb, self.w,
-    )
+  def test_fused_input_concat_block_must_divide_children(self):
+    # a block spanning several children of a concat_ref would need multiple TMA copies per barrier phase
+    x1, x2 = self.rand((128, 32)), self.rand((128, 32))
+    with self.assertRaisesRegex(ValueError, "must divide every child size"):
+      self.check(lambda x1, x2, w: fusible_matmul(jnp.concatenate([x1, x2], 1), w), lambda *_: None, x1, x2, self.w)
+
+  def test_fused_input_concat_partial_block(self):
+    x1, x2, w1, w2 = self.rand((128, 128)), self.rand((128, 128)), self.rand((64, 128)), self.rand((64, 128))
+    xa, xb, w_tall = self.rand((128, 64)), self.rand((128, 64)), self.rand((256, 128))
+    cat = jnp.concatenate
+    cases = {  # name: (fn(matmul, *args), args)
+      "K": (lambda mm, x1, x2, w: mm(cat([x1, x2], 1), w), (x1, x2, w_tall)),
+      "K then elementwise": (lambda mm, x1, x2, w: mm(cat([x1, x2], 1) * 2.0, w), (x1, x2, w_tall)),
+      "M on lhs": (lambda mm, xa, xb, w: mm(cat([xa, xb], 0), w), (xa, xb, self.w)),
+      "N on rhs": (lambda mm, x, w1, w2: mm(x, cat([w1, w2], 1)), (self.x, w1, w2)),
+      "M and N": (lambda mm, xa, xb, w1, w2: mm(cat([xa, xb], 0), cat([w1, w2], 1)), (xa, xb, w1, w2)),
+    }
+    for name, (fn, args) in cases.items():
+      with self.subTest(name):
+        self.check(functools.partial(fn, fusible_matmul), functools.partial(fn, jnp.matmul), *args)
 
   def test_fused_input_split(self):
     x_wide = self.rand((128, 128))

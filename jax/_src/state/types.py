@@ -270,6 +270,44 @@ class SelectTransform(MultiRefTransform):
     return attrs[0]
 
 
+@tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True)
+class ConcatTransform(MultiRefTransform):
+  """Views several Refs as one Ref concatenated along ``axis``.
+
+  Only accesses that stay within one child are lowerable: slicing the concat
+  view with a block that divides every child boundary resolves, at trace time
+  or at runtime, to a slice of exactly one child.
+  """
+  axis: int = tree.static()
+  sizes: tuple[int, ...] = tree.static()
+
+  def transform_types(self, xs):
+    assert isinstance(xs, Sequence), f"Concat expected sequence, got {xs}"
+    for x in xs:
+      if not isinstance(x, AbstractRef):
+        raise TypeError(f"Cannot concat {x}")
+    inner = [x.inner_aval for x in xs]
+    if any(a.dtype != inner[0].dtype or a.ndim != inner[0].ndim for a in inner):
+      raise TypeError(f"Cannot concat Refs of different types: {xs}")
+    shape = list(inner[0].shape)
+    shape[self.axis] = sum(self.sizes)
+    return xs[0].update(inner_aval=inner[0].update(shape=tuple(shape)))
+
+  def undo(self, x: core.AbstractValue) -> Transform:
+    raise NotImplementedError(type(self))
+
+  def pretty_print(self, context: core.JaxprPpContext) -> pp.Doc:
+    del context  # Unused.
+    return pp.text(f"{{concat(axis={self.axis}, sizes={list(self.sizes)})}}")
+
+  def getattr(self, name: str, xs: Sequence[core.AbstractValue]) -> Any:
+    attrs = [getattr(x, name) for x in xs]
+    if any(attrs[0] != attr for attr in attrs[1:]):
+      raise TypeError(f"Cannot resolve attribute {name} from: {attrs}")
+    return attrs[0]
+
+
 @dataclasses.dataclass(slots=True)
 class RefIndexer:
   """An object temporarily generated when doing ``ref.at``."""

@@ -304,6 +304,25 @@ def with_scoped(
   return decorator
 
 
+def concat_ref(*refs, axis: int = 0) -> state_types.TransformedRef:
+  """Views ``refs`` as a single Ref concatenated along ``axis``.
+
+  Only supported for DMA operations, and only for slices that fall within a
+  single child (e.g. a pipeline block size that divides every child boundary).
+
+  Example::
+
+    w_ref = pl.concat_ref(w0_ref, w1_ref, axis=1)
+    plgpu.copy_gmem_to_smem(w_ref.at[:, pl.ds(j * bn, bn)], w_smem, barrier)
+  """
+  if len(refs) <= 1:
+    raise ValueError("At least two refs are required for pl.concat_ref.")
+  sizes = tuple(int(r.shape[axis]) for r in refs)
+  return state_types.TransformedRef(
+      ref=refs, transforms=(state_types.ConcatTransform(axis, sizes),),
+  )
+
+
 def select_ref(idx: jax_typing.Array, *refs) -> state_types.TransformedRef:
   """Selects a ref from a list of refs based on the runtime value of a scalar index.
 

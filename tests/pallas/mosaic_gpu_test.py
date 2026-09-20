@@ -8435,7 +8435,53 @@ class PipelineTest(PallasTest):
         jnp.full(block_size, num_steps, dtype=dtype)
     )
 
-  def test_pipeline_oob_mode(self):
+  @parameterized.product(
+      max_concurrent_steps=[2, 3], repeat=[1, 2, 4], delay_release=[0, 1]
+  )
+  def test_input_block_reuse_across_steps(
+      self, max_concurrent_steps, repeat, delay_release
+  ):
+    # ``x``'s block index only changes every ``repeat`` steps, so its copy is
+    # skipped on the steps in between; ``y``'s block index changes every step.
+    if delay_release >= max_concurrent_steps:
+      self.skipTest("delay_release must be smaller than max_concurrent_steps")
+    m, n, blk_m, blk_n = 64, 128, 32, 64
+    num_steps = n * repeat // blk_n
+
+    def body(_, x_smem, y_smem, o_smem):
+      o_smem[...] = x_smem[...] + y_smem[...]
+
+    def pipeline(x_ref, y_ref, o_ref):
+      i = lax.axis_index("i")
+      plgpu.emit_pipeline(
+          body,
+          grid=(num_steps,),
+          in_specs=[
+              plgpu.BlockSpec(
+                  (blk_m, blk_n),
+                  lambda j: (i, j // repeat),
+                  delay_release=delay_release,
+              ),
+              plgpu.BlockSpec((blk_m, blk_n), lambda j: (i, j)),
+          ],
+          out_specs=[plgpu.BlockSpec((blk_m, blk_n), lambda j: (i, j))],
+          max_concurrent_steps=max_concurrent_steps,
+      )(x_ref, y_ref, o_ref)
+
+    kernel = self.kernel(
+        pipeline,
+        out_type=jax.ShapeDtypeStruct((m, n * repeat), jnp.float32),
+        grid=(m // blk_m,),
+        grid_names=("i",),
+    )
+    x = jax.random.uniform(jax.random.key(0), (m, n), dtype=jnp.float32)
+    y = jax.random.uniform(jax.random.key(1), (m, n * repeat), dtype=jnp.float32)
+    x_blocks = x.reshape(m, n // blk_n, 1, blk_n)
+    x_repeated = jnp.broadcast_to(
+        x_blocks, (m, n // blk_n, repeat, blk_n)
+    ).reshape(m, n * repeat)
+    np.testing.assert_allclose(kernel(x, y), x_repeated + y)
+
     # This test crashes with the default OOB fill mode of ZEROS because
     # it can't copy large 1D arrays.
 

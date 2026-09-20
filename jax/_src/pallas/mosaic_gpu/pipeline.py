@@ -159,7 +159,16 @@ class BufferedRef:
         map(_make_block_slice, index_map(*grid_indices), self.spec.block_shape)
     )
 
-  def copy_in(self, slot, grid_indices, barrier_ref, barrier_slot=None):
+  def compute_block_indices(self, grid_indices) -> tuple[jax.Array, ...]:
+    assert self.spec.index_map is not None
+    return tuple(
+        jnp.asarray(i, dtype=jnp.int32)
+        for i in self.spec.index_map(*grid_indices)
+    )
+
+  def copy_in(
+      self, slot, grid_indices, barrier_ref, barrier_slot=None, predicate=None
+  ):
     if not _in_smem(self.spec):
       return
     assert self.smem_ref is not None
@@ -178,6 +187,7 @@ class BufferedRef:
         barrier,
         collective_axes=getattr(self.spec, "collective_axes", None),
         oob_mode=oob_mode,
+        predicate=predicate,
     )
 
   def copy_out(self, slot, grid_indices, predicate=None):
@@ -219,6 +229,43 @@ def _is_index_invariant(
   if (index_map := spec.index_map) is None:
     return True
   return not any(_uses_arguments(index_map, len(grid)))
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _SlotTracker:
+  """Per-operand SMEM slot that only advances when the block index changes.
+
+  Fetcher and reader each keep one of these; both derive "changed" from the
+  same index map over consecutive grid steps, so they always agree on which
+  slot holds the data for a given step. A fetch whose block index did not
+  change is skipped: its SMEM slot already holds the data, and it still
+  arrives on the step's barrier with zero transaction bytes.
+  """
+  slot: jax.Array
+  block_indices: tuple[jax.Array, ...]
+
+  @classmethod
+  def init(cls, bref: BufferedRef, num_slots: int) -> _SlotTracker:
+    assert bref.spec.block_shape is not None
+    return cls(
+        jnp.asarray(num_slots - 1, dtype=jnp.int32),
+        (jnp.asarray(0, dtype=jnp.int32),) * len(bref.spec.block_shape),
+    )
+
+  def advance(
+      self, bref: BufferedRef, step, grid_indices, num_slots: int
+  ) -> tuple[_SlotTracker, jax.Array]:
+    block_indices = bref.compute_block_indices(grid_indices)
+    changed = functools.reduce(
+        lax.bitwise_or,
+        (old != new for old, new in zip(self.block_indices, block_indices)),
+        step == 0,
+    )
+    slot = lax.select(
+        changed, lax.rem(self.slot + 1, jnp.int32(num_slots)), self.slot
+    )
+    return _SlotTracker(slot, block_indices), changed
 
 
 def _inc_grid_by_1(
@@ -288,6 +335,12 @@ def emit_pipeline[T](
     init_carry: Optional initial carry. If provided, ``body`` handles
       carry-over state between iterations, and the pipeline returns the
       final carry.
+
+  An input whose block index does not change between two consecutive steps is
+  not copied again: its SMEM slot from the previous step is reused, so the
+  per-input SMEM slot advances only when the block index changes. This matches
+  the TPU pipeline semantics and requires no annotation, but only applies to
+  TMA-based copies (Hopper and newer).
 
   Returns:
     A function that, when called with GMEM input and output refs, executes the
@@ -421,11 +474,47 @@ def emit_pipeline[T](
       assert max_concurrent_steps <= num_steps
       prologue_steps = max_concurrent_steps
 
-    def prologue(step, fetch_indices):
-      for bref in in_brefs:
-        bref.copy_in(step, fetch_indices, barrier_ref)
-      return _inc_grid_by_1(fetch_indices, grid)
-    jax.lax.fori_loop(0, prologue_steps, prologue, indices, unroll=not has_dynamic_grid)
+    # Inputs whose block index may repeat across consecutive steps keep their
+    # own SMEM slot and skip the copy when it does. cp.async wait-group
+    # accounting assumes one copy per input per step, so this is TMA-only.
+    tracked = [
+        _in_smem(bref.spec) and not bref.is_index_invariant and not is_cp_async
+        for bref in in_brefs
+    ]
+
+    def fetch(step, slot, fetch_indices, trackers, barrier_slot=None,
+              mask=None):
+      new_trackers = []
+      for i, (bref, is_tracked, tracker) in enumerate(
+          zip(in_brefs, tracked, trackers)):
+        if mask is not None and not mask[i]:
+          new_trackers.append(tracker)
+          continue
+        if not is_tracked:
+          bref.copy_in(slot, fetch_indices, barrier_ref, barrier_slot)
+        else:
+          tracker, changed = tracker.advance(
+              bref, step, fetch_indices, max_concurrent_steps)
+          bref.copy_in(
+              tracker.slot, fetch_indices, barrier_ref,
+              barrier_slot if barrier_slot is not None else slot,
+              predicate=changed)
+        new_trackers.append(tracker)
+      return new_trackers
+
+    def init_trackers():
+      return [
+          _SlotTracker.init(bref, max_concurrent_steps) if is_tracked else None
+          for bref, is_tracked in zip(in_brefs, tracked)
+      ]
+
+    def prologue(step, carry):
+      fetch_indices, trackers = carry
+      trackers = fetch(step, step, fetch_indices, trackers)
+      return _inc_grid_by_1(fetch_indices, grid), trackers
+    _, fetch_trackers = jax.lax.fori_loop(
+        0, prologue_steps, prologue, (indices, init_trackers()),
+        unroll=not has_dynamic_grid)
 
     # This is true if any of the outputs need to be transferred inside the loop.
     smem_out_brefs = [bref for bref in out_brefs if _in_smem(bref.spec)]
@@ -439,7 +528,8 @@ def emit_pipeline[T](
       slot = lax.rem(
           step, jnp.asarray(max_concurrent_steps, dtype=step.dtype)
       )
-      indices, fetch_index_levels, last_store_indices, prev_body_carry = carry
+      (indices, fetch_index_levels, last_store_indices, prev_body_carry,
+       read_trackers, fetch_trackers) = carry
 
       if barrier_ref is not None:
         # Wait for the current GMEM->SMEM copy to complete, if any.
@@ -454,12 +544,18 @@ def emit_pipeline[T](
             max_concurrent_steps - 1, wait_read_only=True
         )
 
+      read_trackers = [
+          tracker.advance(bref, step, indices, max_concurrent_steps)[0]
+          if tracker is not None else None
+          for bref, tracker in zip(in_brefs, read_trackers)
+      ]
+      in_slots = [
+          slot if tracker is None else tracker.slot for tracker in read_trackers
+      ]
       next_body_carry = body(
           indices,
-          *(
-              bref.get_ref_for_slot(slot)
-              for bref in it.chain(in_brefs, out_brefs)
-          ),
+          *(bref.get_ref_for_slot(s) for bref, s in zip(in_brefs, in_slots)),
+          *(bref.get_ref_for_slot(slot) for bref in out_brefs),
           *(prev_body_carry,) if init_carry is not None else (),
       )
 
@@ -504,15 +600,19 @@ def emit_pipeline[T](
             fetch_step,
             jnp.asarray(max_concurrent_steps, dtype=fetch_step.dtype),
         )
-        def do_fetch():
-          for bref in in_brefs:
-            if getattr(bref.spec, "delay_release", 0) == delay_release:
-              bref.copy_in(fetch_slot, fetch_indices, barrier_ref)
+        def do_fetch(fetch_trackers):
+          # Only this level's inputs are fetched; the others keep their state.
+          return fetch(
+              fetch_step, fetch_slot, fetch_indices, fetch_trackers,
+              barrier_slot=fetch_slot,
+              mask=[getattr(bref.spec, "delay_release", 0) == delay_release
+                    for bref in in_brefs])
 
-        jax.lax.cond(
+        fetch_trackers = jax.lax.cond(
             lax.bitwise_and(step >= delay_release, fetch_step < num_steps),
             do_fetch,
-            lambda: None,
+            lambda trackers: trackers,
+            fetch_trackers,
         )
 
       next_fetch_indices_levels = [
@@ -524,6 +624,8 @@ def emit_pipeline[T](
           next_fetch_indices_levels,
           new_store_indices,
           next_body_carry if init_carry is not None else None,
+          read_trackers,
+          fetch_trackers,
       )
 
     fetch_index_levels = []
@@ -546,6 +648,8 @@ def emit_pipeline[T](
         fetch_index_levels,
         last_store_indices,
         init_carry,
+        init_trackers(),
+        fetch_trackers,
     )
     if is_cp_async and copies_per_step > 0:
       if has_dynamic_grid:
@@ -584,9 +688,9 @@ def emit_pipeline[T](
               loop_carry,
               wait_count=(num_steps - 1 - step) * copies_per_step,
           )
-      last_indices, _, _, final_carry = loop_carry
+      last_indices, _, _, final_carry, *_ = loop_carry
     else:
-      last_indices, _, _, final_carry = lax.fori_loop(
+      last_indices, _, _, final_carry, *_ = lax.fori_loop(
           0, num_steps, loop_body, init_loop_carry,
       )
 

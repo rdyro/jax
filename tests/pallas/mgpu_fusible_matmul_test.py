@@ -1,4 +1,5 @@
 """Fusible matmul on Mosaic GPU (sm_120: TMA + Ampere-style mma, no WGMMA/TMEM)."""
+import functools
 import unittest
 import jax
 from jax import lax
@@ -43,7 +44,7 @@ def _fusible_matmul(x, y, z=None, *, bm=64, bk=64, bn=64, stages=2, use_transfor
   sp_flat, sp_tree = jax.tree.flatten((x_sp, y_sp, z_sp))
   # discharged fusions take the arrays the outer Refs hold, so trace with those types
   avals = lambda vals: jax.tree.map(lambda v: getattr(jax.typeof(v), "inner_aval", jax.typeof(v)), vals)
-  sp_handler = lambda i, sp: fuser.make_scalar_prefetch_handler(i) if sp else None
+  sp_handler = lambda i, sp: fuser.make_scalar_prefetch_handler(i)  # always needed: static slice starts also route through it
 
   x_seed = pl.BlockSpec((bm, bk), lambda mi, ni, ki, *_: (mi, ki))
   y_seed = pl.BlockSpec((bk, bn), lambda mi, ni, ki, *_: (ki, ni))
@@ -170,6 +171,23 @@ class MgpuFusibleMatmulTest(unittest.TestCase):
       lambda xa, xb, w: fusible_matmul(jnp.concatenate([xa, xb], 0), w, bm=128),
       lambda xa, xb, w: jnp.concatenate([xa, xb], 0) @ w, xa, xb, self.w,
     )
+
+  def test_fused_input_concat_partial_block(self):
+    x1, x2, w1, w2 = self.rand((128, 128)), self.rand((128, 128)), self.rand((64, 128)), self.rand((64, 128))
+    xa, xb, w_tall = self.rand((128, 64)), self.rand((128, 64)), self.rand((256, 128))
+    x3 = self.rand((128, 64))
+    cat = jnp.concatenate
+    cases = {  # name: (fn(matmul, *args), args)
+      "K": (lambda mm, x1, x2, w: mm(cat([x1, x2], 1), w), (x1, x2, w_tall)),
+      "K then elementwise": (lambda mm, x1, x2, w: mm(cat([x1, x2], 1) * 2.0, w), (x1, x2, w_tall)),
+      "K three children": (lambda mm, x1, x3, x2, w: mm(cat([x1, x3, x2], 1), w), (x1, x3, x2, self.rand((320, 128)))),
+      "M on lhs": (lambda mm, xa, xb, w: mm(cat([xa, xb], 0), w), (xa, xb, self.w)),
+      "N on rhs": (lambda mm, x, w1, w2: mm(x, cat([w1, w2], 1)), (self.x, w1, w2)),
+      "M and N": (lambda mm, xa, xb, w1, w2: mm(cat([xa, xb], 0), cat([w1, w2], 1)), (xa, xb, w1, w2)),
+    }
+    for name, (fn, args) in cases.items():
+      with self.subTest(name):
+        self.check(functools.partial(fn, fusible_matmul), functools.partial(fn, jnp.matmul), *args)
 
   def test_fused_input_split(self):
     x_wide = self.rand((128, 128))

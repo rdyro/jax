@@ -1777,7 +1777,7 @@ def _get_eval_rule(ctx: KernelEvalContext, ref, *idx, tree):
   return ref.get(idx=tuple(block_indexer))
 
 
-@register_eval_rule(lax.concatenate_p)
+@register_eval_rule(lax.concatenate_p, ref_polymorphic=True)
 def _concatenate_eval_rule(ctx: KernelEvalContext, *args, dimension):
   # We now handle the case where each of the concatenated array dimensions
   # divides the block size.
@@ -1795,7 +1795,8 @@ def _concatenate_eval_rule(ctx: KernelEvalContext, *args, dimension):
   if block_dim == sum(aval.shape[dimension] for aval in ctx.avals_in):
     # Handle special case if the block contains all of the concatenated
     # array.
-    return jax.lax.concatenate(args, dimension=dimension)
+    return jax.lax.concatenate(
+        util.safe_map(_deref, args), dimension=dimension)
 
   num_blocks = []
   for aval in ctx.avals_in:
@@ -1817,6 +1818,14 @@ def _concatenate_eval_rule(ctx: KernelEvalContext, *args, dimension):
     start, end = starts[i], ends[i]
     is_valid = (start <= block_idx) & (block_idx < end)
     valid_index = jax.lax.select(is_valid, i, valid_index)
+  if any(map(_is_ref, args)):
+    # Loading every child's block and selecting is branch-free, which is
+    # cheaper than switching on GPUs. Inactive children are pinned to a
+    # constant block index, so pipelines that skip unchanged copies never
+    # refetch them.
+    if isinstance(valid_index, int):
+      return _deref(args[valid_index])
+    return jax.lax.select_n(valid_index, *util.safe_map(_deref, args))
   out_dtype = args[0].dtype
   args = [a.astype(jnp.float32) if a.dtype == jnp.bfloat16 else a for a in args]
   valid_block = jax.lax.select_n(valid_index, *args)
@@ -1885,13 +1894,10 @@ def _concatenate_rule(
       is_valid = (starts[child_index] <= block_idx) & (
           block_idx < ends[child_index]
       )
-      padding_index = jnp.where(
-          block_idx < starts[child_index], 0, num_blocks[child_index] - 1
-      )
-      block_idx = jnp.where(
-          is_valid, block_idx - starts[child_index], padding_index
-      )
-      return util.tuple_update(idx, dimension, block_idx)
+      idx = util.tuple_update(idx, dimension, block_idx - starts[child_index])
+      # An inactive child's block is never read, so pin its index in every
+      # dimension: pipelines that skip unchanged blocks then never refetch it.
+      return tuple(jnp.where(is_valid, i, 0) for i in idx)
 
     return block_transform.replace(
         block_index_transform=new_block_index_transform

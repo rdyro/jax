@@ -2414,11 +2414,6 @@ def _concatenate_lowering_rule_wg(ctx: LoweringRuleContext, *args, dimension):
 @register_lowering_rule(lax.select_n_p, mgpu.LoweringSemantics.Warpgroup)
 @register_lowering_rule(lax.select_n_p, *gpu_core.WGxWARP_SEMANTICS)
 def _select_n_lowering_rule(ctx: LoweringRuleContext, pred, *cases):
-  if len(cases) != 2:
-    raise NotImplementedError(
-        "Mosaic GPU lowering only supports select_n with 2 cases, got"
-        f" {len(cases)}"
-    )
   pred_aval, *cases_avals = ctx.avals_in
   if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
     if not all(aval.shape == () for aval in ctx.avals_in):
@@ -2426,21 +2421,59 @@ def _select_n_lowering_rule(ctx: LoweringRuleContext, pred, *cases):
           "Can only select on scalars in warp-level lowering.")
   [out_aval] = ctx.avals_out
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    if len(cases) != 2:
+      raise NotImplementedError(
+          "Mosaic GPU lowering only supports select_n with 2 cases, got"
+          f" {len(cases)}"
+      )
     pred = _ensure_fa(pred, pred_aval.dtype)
     cases = _bcast(*cases, *cases_avals, out_aval=out_aval)
     # ``select`` expects the first case to be the true branch, but ``select_n``
     # orders the cases in reverse.
     return pred.select(*reversed(cases))
   else:
-    pred = _ensure_ir_value(pred, pred_aval.dtype)
-    cases = [_ensure_ir_value(c, c_aval.dtype) for c, c_aval in zip(cases, cases_avals)]
-    # TODO(bchetioui): support implicit broadcast.
-    if any(a.shape != out_aval.shape for a in ctx.avals_in):
+    if pred_aval.shape and pred_aval.shape != out_aval.shape:
       raise NotImplementedError(
-          "Implicit broadcast not implemented with warpgroup semantics")
-    # ``select`` expects the first case to be the true branch, but ``select_n``
-    # orders the cases in reverse.
-    return arith_dialect.select(pred, *reversed(cases))
+          "Implicit broadcast of a non-scalar predicate not implemented with"
+          " warpgroup semantics")
+
+    def bcast(value, aval):
+      # Scalars (a scalar predicate or a scalar case) are broadcast to the
+      # output shape. Vector operands must already match it.
+      if not out_aval.shape or aval.shape == out_aval.shape:
+        return value
+      if aval.shape:
+        raise NotImplementedError(
+            "Implicit broadcast not implemented with warpgroup semantics")
+      ty = ir.VectorType.get(
+          out_aval.shape, mgpu_utils.dtype_to_ir_type(aval.dtype))
+      return vector_dialect.broadcast(ty, value)
+
+    pred = _ensure_ir_value(pred, pred_aval.dtype)
+    cases = [
+        bcast(_ensure_ir_value(c, a.dtype), a)
+        for c, a in zip(cases, cases_avals)
+    ]
+    bool_aval = pred_aval.update(dtype=jnp.bool_)
+    if pred_aval.dtype == jnp.bool_:
+      assert len(cases) == 2
+      # ``select`` expects the first case to be the true branch, but
+      # ``select_n`` orders the cases in reverse.
+      return arith_dialect.select(bcast(pred, bool_aval), *reversed(cases))
+    # Integer predicate: chain two-way selects on ``pred == i``. The compare
+    # happens at the predicate's own shape (a scalar for a scalar predicate);
+    # only the resulting bit is broadcast.
+    pred_ty = ir.IntegerType(
+        pred.type.element_type if isinstance(pred.type, ir.VectorType)
+        else pred.type)
+    out = cases[0]
+    for i, case in enumerate(cases[1:], start=1):
+      c = arith_dialect.constant(pred_ty, ir.IntegerAttr.get(pred_ty, i))
+      if isinstance(pred.type, ir.VectorType):
+        c = vector_dialect.broadcast(pred.type, c)
+      is_i = arith_dialect.cmpi(arith_dialect.CmpIPredicate.eq, pred, c)
+      out = arith_dialect.select(bcast(is_i, bool_aval), case, out)
+    return out
 
 
 @register_lowering_rule(lax.broadcast_in_dim_p, mgpu.LoweringSemantics.Lane)

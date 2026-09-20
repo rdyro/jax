@@ -937,8 +937,8 @@ class PullBlockSpecTest(jtu.JaxTestCase):
     x_block_spec, y_block_spec = in_block_specs
     self.assertEqual(x_block_spec.block_shape, (128, 128))
     self.assertEqual(y_block_spec.block_shape, (128, 128))
-    # Indices in this concatenate should be clamped depending on if the
-    # block is OOB.
+    # A child that is not read for a block is pinned to block index 0 in
+    # every dimension, so pipelines never refetch it.
     self.assertEqual(
         x_block_spec.index_map(0, 0, scalar_prefetch_values), (0, 0)
     )
@@ -946,10 +946,10 @@ class PullBlockSpecTest(jtu.JaxTestCase):
         x_block_spec.index_map(1, 0, scalar_prefetch_values), (1, 0)
     )
     self.assertEqual(
-        x_block_spec.index_map(2, 0, scalar_prefetch_values), (1, 0)
+        x_block_spec.index_map(2, 0, scalar_prefetch_values), (0, 0)
     )
     self.assertEqual(
-        x_block_spec.index_map(3, 0, scalar_prefetch_values), (1, 0)
+        x_block_spec.index_map(3, 0, scalar_prefetch_values), (0, 0)
     )
     self.assertEqual(
         y_block_spec.index_map(0, 0, scalar_prefetch_values), (0, 0)

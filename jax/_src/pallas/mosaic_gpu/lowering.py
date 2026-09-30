@@ -1943,6 +1943,61 @@ def _ndindexer_indices(
   return tuple(indices)
 
 
+def _get_packed_lowering(
+    ctx: LoweringRuleContext, x_ref, leaves, transforms, transform_avals, optimized
+) -> mgpu.FragmentedArray | None:
+  """Lowers a load of ``ref.bitcast(narrow_dtype)`` into a layout without relayouts.
+
+  ``Ref.bitcast`` to a narrower type packs second-minor neighbors (see
+  `TiledLayout.pack_second_minor`), so when every register of the requested
+  layout holds exactly the elements of one wide element, the wide array is
+  loaded in the packed layout and its registers are reinterpreted. For example,
+  a byte array of k-adjacent 4-bit pairs bitcast to ``jnp.int4`` loads straight
+  into the ``MMA_RHS`` layout. Returns None if the load is not such a bitcast.
+  """
+  bitcast_idx = next((i for i, t in reversed(list(enumerate(transforms)))
+                      if isinstance(t, state_types.BitcastTransform)), None)
+  if bitcast_idx is None or not all(
+      isinstance(t, indexing.NDIndexer) and not t.int_indexer_shape
+      and all(isinstance(i, indexing.Slice) and not i.is_dynamic_start and i.start == 0
+              for i in t.indices)
+      for t in transforms[bitcast_idx + 1:]
+  ):  # Only a bitcast followed by trivial indexers is lowered here.
+    return None
+  pre_transforms = transforms[:bitcast_idx]
+  wide_aval = state_types.transform_type(pre_transforms, ctx.avals_in[0])
+  assert isinstance(wide_aval, state_types.AbstractRef)
+  wide_dtype, narrow_aval = wide_aval.dtype, ctx.avals_out[0]
+  wide_bits, narrow_bits = map(dtypes.itemsize_bits, (wide_dtype, narrow_aval.dtype))
+  if narrow_bits >= wide_bits:
+    return None
+  layout = ctx.out_layout_hint
+  if not isinstance(layout, mgpu.TiledLayout):
+    raise NotImplementedError(
+        "Loading a Ref bitcast to a narrower type requires a tiled layout, e.g."
+        " `plgpu.load(ref.bitcast(dtype), layout=...)`."
+    )
+  # Flatten the avals, not the lowered leaves: those can be pytrees themselves.
+  pre_leaves, pre_tree = jax.tree.flatten(transform_avals[:bitcast_idx])
+  wide_fa = _get_lowering_rule(
+      ctx.replace(
+          avals_in=[ctx.avals_in[0], *ctx.avals_in[1:1 + len(pre_leaves)]],
+          avals_out=[jax_core.ShapedArray(wide_aval.shape, wide_dtype)],
+          out_layout_hint=layout.pack_second_minor(wide_bits // narrow_bits),
+      ),
+      x_ref, *leaves[:len(pre_leaves)], tree=pre_tree, optimized=optimized,
+  )
+  narrow_ty = mgpu_utils.dtype_to_ir_type(narrow_aval.dtype)
+  vec_ty = ir.VectorType.get((layout.vector_length,), narrow_ty)
+  registers = np.array(
+      [mgpu_utils.bitcast(r, vec_ty) for r in wide_fa.registers.flat], dtype=object
+  ).reshape(layout.registers_shape(narrow_aval.shape))
+  return mgpu.FragmentedArray(
+      _registers=registers, _layout=layout,
+      _is_signed=mgpu_utils.is_signed(narrow_aval.dtype),
+  )
+
+
 @register_lowering_rule(sp.get_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(sp.get_p, *gpu_core.LANExWARP_SEMANTICS)
 def _get_lowering_rule(
@@ -1965,6 +2020,11 @@ def _get_lowering_rule(
   transforms = jax.tree.unflatten(tree, leaves)
   assert isinstance(ctx.avals_in[0], state_types.AbstractRef)
   transform_avals = tree.unflatten(ctx.avals_in[1:])
+
+  if (packed := _get_packed_lowering(
+      ctx, x_ref, leaves, transforms, transform_avals, optimized
+  )) is not None:
+    return packed
 
   # Swizzle always applies first, to the raw addresses, so we pop it immediately.
   if transforms and isinstance(transforms[0], gpu_core.UnswizzleRef):

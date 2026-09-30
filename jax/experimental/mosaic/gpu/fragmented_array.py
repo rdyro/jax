@@ -638,6 +638,38 @@ class TiledLayout:
       )
     return reduced_layout
 
+  def pack_second_minor(self, ratio: int) -> TiledLayout:
+    """Returns the layout of this array with `ratio` second-minor neighbors packed into one element.
+
+    Packing follows the convention of ``Ref.bitcast`` to a `ratio` times
+    narrower type: element ``(..., r, c)`` of the packed array holds elements
+    ``(..., ratio * r + j, c)`` for ``j < ratio``, the lowest ``j`` in the least
+    significant bits. Every register must be a vector of exactly `ratio`
+    second-minor neighbors, so that each register of the packed array holds the
+    bits of the same register of this one, and converting between the two is
+    free. For example, the ``MMA_RHS`` layout of a 16-bit type holds two
+    k-adjacent elements per register: packing it by 2 gives the layout in which
+    a byte array of k-adjacent 4-bit pairs is loaded to become that operand.
+    """
+    tiles = self.tiling.tiles
+    if len(tiles[-1]) < 2 or self.vector_dim != -2 or tiles[-1][-2] != ratio:
+      raise ValueError(
+          f"Cannot pack {self} by {ratio}: registers must be vectors of {ratio}"
+          " elements along the second-minor dimension"
+      )
+    if any(len(t) >= 2 and t[-2] % ratio for t in tiles):
+      raise ValueError(f"Cannot pack {self} by {ratio}: indivisible tiling")
+    packed_tiles = tuple(
+        t if len(t) < 2 else (*t[:-2], t[-2] // ratio, t[-1]) for t in tiles
+    )
+    return TiledLayout(
+        Tiling(packed_tiles),
+        self.warp_dims,
+        self.lane_dims,
+        self.vector_dim,
+        _check_canonical=False,
+    ).canonicalize()
+
   def canonicalize(self) -> TiledLayout:
     """Returns a version of this layout where tiling is canonical."""
     canonical_tiling = self.tiling.canonicalize()

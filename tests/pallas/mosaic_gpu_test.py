@@ -48,6 +48,7 @@ from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering as mgpu_lowering
 from jax._src.pallas.mosaic_gpu import pipeline as mgpu_pipeline
 from jax._src.state import types as state_types
+from jax._src.state import utils as state_utils
 from jax.experimental import pallas as pl
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as _plgpu
@@ -4536,6 +4537,71 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         ],
     )(inp)
     np.testing.assert_array_equal(result, x + y)
+
+  @parameterized.product(
+      dtype=(jnp.int4, jnp.float4_e2m1fn),
+      compute_dtype=(jnp.bfloat16, jnp.float16),
+      transposed=(False, True),
+      m_warps=(1, 4),
+  )
+  def test_mma_rhs_from_packed_ref(self, dtype, compute_dtype, transposed, m_warps):
+    # Bytes of k-adjacent 4-bit pairs, bitcast to 4 bits (which packs along the
+    # second-minor dim), load straight into the MMA B operand layout.
+    self.skip_if_wg_semantics()
+    if dtype == jnp.float4_e2m1fn and not jtu.is_cuda_compute_capability_at_least("10.0"):
+      self.skipTest("f4e2m1fn casts are only supported on Blackwell and newer")
+    m, k, n = 16 * m_warps, 64, 128
+    layout = lambda l: l(compute_dtype, m_warps=m_warps)
+
+    @functools.partial(
+        self.kernel, out_type=jax.ShapeDtypeStruct((m, n), jnp.float32)
+    )
+    def kernel(a_ref, b_ref, o_ref):
+      b_ref = (b_ref.T if transposed else b_ref).bitcast(dtype)  # (k, n)
+      b = plgpu.load(b_ref, layout=layout(plgpu.Layout.MMA_RHS), optimized=False)
+      a = plgpu.load(a_ref, layout=layout(plgpu.Layout.MMA_LHS), optimized=False)
+      acc = plgpu.layout_cast(
+          jnp.zeros((m, n), jnp.float32), layout(plgpu.Layout.MMA_ACC)
+      )
+      plgpu.store(o_ref, plgpu.mma(acc, a, b.astype(compute_dtype)), optimized=False)
+
+    prng = np.random.default_rng(0)
+    a = prng.uniform(-1, 1, (m, k)).astype(compute_dtype)
+    b = prng.integers(0, 256, (k // 2, n)).astype(jnp.uint8)
+    b_unpacked = state_utils.bitcast(jnp.asarray(b), dtype).astype(jnp.float32)
+    res = kernel(a, b.T if transposed else b)
+    np.testing.assert_allclose(
+        res, a.astype(jnp.float32) @ b_unpacked, atol=1e-2, rtol=1e-2
+    )
+
+  def test_mma_rhs_from_dynamically_indexed_packed_ref(self):
+    self.skip_if_wg_semantics()
+    m, k, n = 16, 64, 128
+    layout = lambda l: l(jnp.bfloat16, m_warps=1)
+
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((2, m, n), jnp.float32),
+        grid=(2,),
+        grid_names=("i",),
+    )
+    def kernel(a_ref, b_ref, o_ref):
+      i = lax.axis_index("i")
+      b_ref = b_ref.at[pl.ds(i * (k // 2), k // 2)].bitcast(jnp.int4)
+      b = plgpu.load(b_ref, layout=layout(plgpu.Layout.MMA_RHS), optimized=False)
+      a = plgpu.load(a_ref, layout=layout(plgpu.Layout.MMA_LHS), optimized=False)
+      acc = plgpu.layout_cast(
+          jnp.zeros((m, n), jnp.float32), layout(plgpu.Layout.MMA_ACC)
+      )
+      acc = plgpu.mma(acc, a, b.astype(jnp.bfloat16))
+      plgpu.store(o_ref.at[i], acc, optimized=False)
+
+    prng = np.random.default_rng(0)
+    a = prng.uniform(-1, 1, (m, k)).astype(jnp.bfloat16)
+    b = prng.integers(0, 256, (k, n)).astype(jnp.uint8)
+    b_unpacked = state_utils.bitcast(jnp.asarray(b), jnp.int4).astype(jnp.float32)
+    ref = jnp.stack([a.astype(jnp.float32) @ b_unpacked[i * k:(i + 1) * k] for i in range(2)])
+    np.testing.assert_allclose(kernel(a, b), ref, atol=1e-2, rtol=1e-2)
 
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_atomic_add_gmem(self):

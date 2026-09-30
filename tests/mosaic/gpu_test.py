@@ -5845,6 +5845,28 @@ class FragmentedArrayTest(TestCase):
   def test_layout_reduction_definition(self, layout, expected_reduced_layout, axis):
     self.assertEqual(layout.reduce((axis,)), expected_reduced_layout)
 
+  @parameterized.parameters(1, 2, 4)
+  def test_layout_pack_second_minor_definition(self, m_warps):
+    # Each 16-bit MMA B register holds two k-adjacent elements: the packed
+    # layout holds each pair as one byte, in the same register.
+    rhs = mgpu.MMALayouts(jnp.bfloat16, m_warps=m_warps).rhs
+    packed = rhs.pack_second_minor(2)
+    self.assertEqual(packed.vector_length, 1)
+    self.assertEqual(
+        packed.tiling.tiles, tuple((t[0] // 2, t[1]) for t in rhs.tiling.tiles[:-1]) + ((1,),)
+    )
+    self.assertEqual(
+        math.prod(packed.registers_shape((32, 128))),
+        math.prod(rhs.registers_shape((64, 128))),
+    )
+
+  def test_layout_pack_second_minor_requires_second_minor_vectors(self):
+    with self.assertRaisesRegex(ValueError, "second-minor"):
+      fa.WGMMA_LAYOUT.pack_second_minor(2)  # Vectors along the minor dim.
+    rhs = mgpu.MMALayouts(jnp.bfloat16, m_warps=1).rhs
+    with self.assertRaisesRegex(ValueError, "second-minor"):
+      rhs.pack_second_minor(4)  # Vectors of 2 elements.
+
   def test_layout_reduction_handles_tiles_with_three_different_ranks(self):
     layout = fa.TiledLayout(
         tiling=fa.Tiling(tiles=((1, 2, 64), (2, 16), (8,), (4,), (2,), (1,))),

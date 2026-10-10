@@ -354,21 +354,45 @@ class RebindableTest(jtu.JaxTestCase):
     rebound = rebind(traced, lambda s: dict(k=5.))
     self.assertAllClose(rebound.lower().compile()(xs), 5. * xs)
 
-  def test_nested_rebindables_raise(self):
-    @partial(rebindable, hyperparams='k', name='inner')
-    def inner(x, *, k):
+  def test_nested_rebindables(self):
+    @partial(rebindable, hyperparams='k', rebindable_id='inner')
+    def inner(x, *, k=2.):
       return x * k
 
-    @partial(rebindable, hyperparams='j', name='outer')
-    def outer(x, *, j):
-      return inner(x, k=j + 1.)
+    @partial(rebindable, hyperparams='n', rebindable_id='outer')
+    def outer(x, *, n=1):  # `n` changes how many calls its body has
+      for _ in range(n):
+        x = inner(x)
+      return x
 
-    with self.assertRaisesRegex(ValueError,
-                                "inside the body of rebindable outer"):
-      jax.jit(lambda x: outer(x, j=1.)).trace(jnp.ones(3))
-    # The body stack is reset after the error.
-    self.assertAllClose(jax.jit(lambda x: inner(x, k=2.))(jnp.ones(3)),
-                        2. * jnp.ones(3))
+    x = jnp.ones(3)
+    traced = jax.jit(lambda x: outer(x)).trace(x)
+    self.assertEqual([s.rebindable_id for s in extract_rebindables(traced)],
+                     ['outer', 'inner'])  # parents first
+    self.assertAllClose(traced.lower().compile()(x), 2. * x)
+
+    # The rule rebinds the parent, then the calls in its retraced body.
+    rebound = rebind(traced, {'outer': dict(n=3), 'inner': dict(k=5.)})
+    self.assertEqual(
+        [(s.rebindable_id, s.rebindable.hyperparams)
+         for s in extract_rebindables(rebound)],
+        [('outer', {'n': 3})] + [('inner', {'k': 5.})] * 3)
+    self.assertAllClose(rebound.lower().compile()(x), 125. * x)
+    # Rebinding only a nested call keeps its parent's hyperparameters.
+    rebound = rebind(traced, {'inner': dict(k=5.)})
+    self.assertEqual(extract_rebindables(rebound)[0].rebindable.hyperparams,
+                     {})
+    self.assertAllClose(rebound.lower().compile()(x), 5. * x)
+
+    # Under `rebinding`, calls in a body retraced when lowered see the rule.
+    f = jax.jit(lambda x: outer(x))
+    with rebinding({'outer': dict(n=2), 'inner': dict(k=3.)}):
+      self.assertAllClose(f(x), 9. * x)
+    xs = jnp.ones((2, 3))
+    g = jax.jit(jax.vmap(lambda x: outer(x, n=2)))
+    self.assertAllClose(g(xs), 4. * xs)
+    with rebinding({'inner': dict(k=3.)}):
+      self.assertAllClose(g(xs), 9. * xs)
 
   def test_rebindable_vmap_batches_only_dependent_outputs(self):
     @partial(rebindable, hyperparams='k')

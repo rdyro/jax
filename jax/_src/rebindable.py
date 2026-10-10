@@ -20,7 +20,6 @@ from collections.abc import Callable, Hashable, Iterable, Sequence
 import dataclasses
 from functools import partial, update_wrapper
 import operator
-import threading
 from typing import Any
 
 from jax._src import api
@@ -48,24 +47,14 @@ def _typeof_tree(args):
   return tree_unflatten(tree, [typeof(x) for x in leaves])
 
 
-class _BodyStack(threading.local):
-  names: tuple[str, ...] = ()  # rebindables whose bodies are being traced
-
-_bodies = _BodyStack()
-
-
 @weakref_lru_cache
 def _trace_cached(fn, in_tree, in_avals_flat, hp_items):
   in_avals, hyperparams = tree_unflatten(in_tree, in_avals_flat), dict(hp_items)
   static = tuple(hyperparams)
-  prev, _bodies.names = _bodies.names, (*_bodies.names, fun_name(fn))
   args = ft.flatten_static_argnums_argnames(in_avals, hyperparams, (), static)
   dbg = debug_info("rebindable", fn, in_avals, hyperparams,
                    static_argnames=static)
-  try:
-    jaxpr, out_avals = pe.trace_to_jaxpr(fn, args, dbg)
-  finally:
-    _bodies.names = prev
+  jaxpr, out_avals = pe.trace_to_jaxpr(fn, args, dbg)
   if any(isinstance(c, core.Tracer) for c in jaxpr.consts):
     raise UnexpectedTracerError(
         f"rebindable {fun_name(fn)} closes over a traced value; pass it as an "
@@ -113,8 +102,12 @@ class Rebindable(HiPrim):
     self.in_avals = tuple(in_avals)
     if jaxpr is None:
       leaves, tree = tracing_registry.flatten(self.in_avals)
-      jaxpr, out_avals = _trace_cached(fn, tree, tuple(leaves),
-                                       tuple(sorted(hyperparams.items())))
+      prev = _rule.swap_local(rule)  # for calls nested in the body
+      try:
+        jaxpr, out_avals = _trace_cached(fn, tree, tuple(leaves),
+                                         tuple(sorted(hyperparams.items())))
+      finally:
+        _rule.set_local(prev)
       out_tree = out_avals.tree
     self.out_aval = tree_unflatten(out_tree, jaxpr.out_avals)
     self.effects = frozenset(core.positional_effects(jaxpr))
@@ -142,7 +135,11 @@ class Rebindable(HiPrim):
 
   def rebind(self, **hyperparams) -> Rebindable:
     """Traces the body for `hyperparams`, in the current context."""
-    new = self._new(self.fn, self._rebound(hyperparams), self.in_avals)
+    return self._rebind(hyperparams, rule=None)
+
+  def _rebind(self, hyperparams, rule) -> Rebindable:
+    new = self._new(self.fn, self._rebound(hyperparams), self.in_avals,
+                    rule=rule)
     if (new.out_avals_flat != self.out_avals_flat
         or new.out_tree != self.out_tree or new.effects != self.effects):
       raise TypeError(
@@ -155,12 +152,13 @@ class Rebindable(HiPrim):
   def expand(self, *args):
     # Lowering expands only the calls left in the final program, each in its
     # eqn's context, so the rule sees the types and mesh its site has.
+    t = self
     if self.rule is not None and (
         hp := self.rule(RebindableSite(self, core.JaxprEqnContext(), None))):
-      return self.rebind(**hp).expand(*args)
-    out = core.eval_jaxpr(self.jaxpr, self.jaxpr.consts,
-                          *tree_leaves_checked(self.in_tree, args))
-    return tree_unflatten(self.out_tree, out)
+      t = self._rebind(hp, self.rule)  # the rule also applies to nested calls
+    out = core.eval_jaxpr(t.jaxpr, t.jaxpr.consts,
+                          *tree_leaves_checked(t.in_tree, args))
+    return tree_unflatten(t.out_tree, out)
 
   def _map_fn(self, transform, jaxpr, *args):
     # A transformation of both the recipe `fn` and the body `jaxpr`.
@@ -229,12 +227,6 @@ def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
 
   @traceback_util.api_boundary
   def wrapper(*args, **kwargs):
-    if _bodies.names:
-      raise ValueError(
-          f"rebindable {op_name} is called inside the body of rebindable "
-          f"{_bodies.names[-1]}; nested rebindables are not supported. Make "
-          f"{op_name} a plain function of the outer rebindable's "
-          "hyperparameters.")
     id_ = kwargs.pop("rebindable_id", rebindable_id)
     hp = {k: kwargs.pop(k) for k in hp_names if k in kwargs}
     in_ft = ft.flatten_static_argnums_argnames(
@@ -333,10 +325,10 @@ def _map_rebindables(jaxpr: core.Jaxpr, sites: list[RebindableSite],
     if isinstance(v, tuple):
       new = tuple(sub(x, eqn) for x in v)
       return v if all(map(operator.is_, new, v)) else new
-    if isinstance(v, Rebindable):
+    if isinstance(v, Rebindable):  # parents first: its body is walked below
       sites.append(site := RebindableSite(v, eqn.ctx, eqn))
-      return (rebind and rebind(site)) or v
-    if isinstance(v, HiPrim):  # e.g. Fusible, RematTraced, VmapOf
+      v = (rebind and rebind(site)) or v
+    if isinstance(v, HiPrim):  # e.g. Fusible, RematTraced, VmapOf, Rebindable
       changed = {k: new for k, x in v.params.items()
                  if (new := sub(x, eqn)) is not x}
       # A type-preserving rewrite: rebinding never changes types or effects.
@@ -360,8 +352,7 @@ def extract_rebindables(traced: stages.Traced) -> list[RebindableSite]:
   called from the fwd/bwd rules of a `jax.custom_vjp` appear only in a program
   traced under differentiation (e.g. `jax.grad`), since the rules run only
   then. Rebindables themselves are never differentiated: doing so raises
-  `NotImplementedError`. Calling a rebindable inside another rebindable's body
-  raises a `ValueError`.
+  `NotImplementedError`. Calls nested in a rebindable's body come after it.
   """
   sites: list[RebindableSite] = []
   _map_rebindables(traced.jaxpr, sites)

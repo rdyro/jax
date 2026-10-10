@@ -19,7 +19,8 @@ retracing the program. Typical use:
    under :func:`rebinding` with the same rule, which applies it when lowering.
 
 Rebindables are never differentiated (call them from the rules of a
-:func:`jax.custom_vjp` instead) and cannot be nested.
+:func:`jax.custom_vjp` instead). They may be nested: rebinding a call retraces
+its body, and the rule is then applied to the calls in it.
 
 .. currentmodule:: jax.experimental.rebindable
 

@@ -90,11 +90,11 @@ class Rebindable(HiPrim):
   fn: Callable
   hp_names: tuple[str, ...]  # those it may be rebound with
   name: str
-  key: Hashable
+  rebindable_id: Hashable
   trace_context: Any  # config.trace_context() when first bound
 
-  def __init__(self, fn, hyperparams, in_avals, *, hp_names, name, key=None,
-               trace_context=None, out_type=None):
+  def __init__(self, fn, hyperparams, in_avals, *, hp_names, name,
+               rebindable_id=None, trace_context=None, out_type=None):
     # `out_type` is `(out_aval, effects)` if already known, e.g. when rebinding.
     for k, v in hyperparams.items():
       try:
@@ -113,13 +113,13 @@ class Rebindable(HiPrim):
       out_type = out_avals.unflatten(), core.positional_effects(jaxpr)
     self.out_aval, self.effects = out_type[0], frozenset(out_type[1])
     self.params = dict(fn=fn, hyperparams=hp_items, hp_names=hp_names,
-                       name=name, key=key,
+                       name=name, rebindable_id=rebindable_id,
                        trace_context=trace_context, in_avals=self.in_avals)
     super().__init__()
 
   def _new(self, fn, hyperparams, in_avals, out_type=None) -> Rebindable:
     return Rebindable(fn, hyperparams, in_avals, hp_names=self.hp_names,
-                   name=self.name, key=self.key,
+                   name=self.name, rebindable_id=self.rebindable_id,
                    trace_context=self.trace_context, out_type=out_type)
 
   hyperparams = property(lambda self: dict(self.params["hyperparams"]))
@@ -188,7 +188,7 @@ class Rebindable(HiPrim):
 def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
                static_argnums: int | Sequence[int] | None = None,
                static_argnames: str | Iterable[str] | None = None,
-               name: str | None = None, key: Hashable = None):
+               name: str | None = None, rebindable_id: Hashable = None):
   """Stages calls `fn(*args, **kwargs)` as :class:`Rebindable`s.
 
   `hyperparams` names the keyword arguments a tuner may rebind: hashable and
@@ -198,18 +198,24 @@ def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
   a rebindable called inside a `fuser.fusible` body takes the fused prologue and
   epilogue as inputs. Hyperparameter-dependent ops written in the body run
   inside the kernel's trace but are not fused as prologue/epilogue; build such
-  a `Fusion` explicitly if needed. `key` is an optional hashable label for the
-  call's sites, e.g. to rebind them from a table of tuned values.
+  a `Fusion` explicitly if needed. `rebindable_id` is an optional hashable label
+  for the call's sites, e.g. to rebind them from a table of tuned values; a call
+  may override it with a `rebindable_id=` keyword argument (which `fn` never
+  sees), e.g. when its closed-over static arguments matter to tuned values.
   """
   if fn is None:
     return partial(rebindable, hyperparams=hyperparams,
                    static_argnums=static_argnums,
-                   static_argnames=static_argnames, name=name, key=key)
+                   static_argnames=static_argnames, name=name,
+                   rebindable_id=rebindable_id)
   hp_names = ((hyperparams,) if isinstance(hyperparams, str)
               else tuple(hyperparams))
+  sig = api_util.fun_signature(fn)
+  if sig is not None and "rebindable_id" in sig.parameters:
+    raise TypeError(f"{fun_name(fn)} has a parameter named `rebindable_id`, "
+                    "which rebindable reserves for calls.")
   _, _, static_argnums, static_argnames = api_util.resolve_argnums(
-      fn, api_util.fun_signature(fn), None, None, static_argnums,
-      static_argnames)
+      fn, sig, None, None, static_argnums, static_argnames)
   op_name = name or fun_name(fn)
 
   @traceback_util.api_boundary
@@ -220,6 +226,7 @@ def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
           f"{_bodies.names[-1]}; nested rebindables are not supported. Make "
           f"{op_name} a plain function of the outer rebindable's "
           "hyperparameters.")
+    id_ = kwargs.pop("rebindable_id", rebindable_id)
     hp = {k: kwargs.pop(k) for k in hp_names if k in kwargs}
     in_ft = ft.flatten_static_argnums_argnames(
         args, kwargs, static_argnums, static_argnames)
@@ -229,7 +236,7 @@ def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
       return fn(*args, **kwargs, **hp)
     body.__name__ = op_name
     return Rebindable(body, hp, map(typeof, in_ft.vals), hp_names=hp_names,
-                      name=op_name, key=key)(*in_ft.vals)
+                      name=op_name, rebindable_id=id_)(*in_ft.vals)
   return update_wrapper(wrapper, fn)
 
 
@@ -237,7 +244,7 @@ def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
 class RebindableSite:
   """A call of a rebindable in a traced program.
 
-  `rebindable` is what runs (function, hyperparameters, operand types, key) and
+  `rebindable` is what runs (function, hyperparameters, operand types, id) and
   `ctx` the context it was called in (abstract mesh, xla_metadata, ...).
   """
   rebindable: Rebindable
@@ -249,8 +256,8 @@ class RebindableSite:
     return self.rebindable.name
 
   @property
-  def key(self) -> Hashable:
-    return self.rebindable.key
+  def rebindable_id(self) -> Hashable:
+    return self.rebindable.rebindable_id
 
   @property
   def abstract_mesh(self):
@@ -350,7 +357,7 @@ def extract_rebindables(traced: stages.Traced) -> list[RebindableSite]:
 def rebind(traced: stages.Traced, rule) -> stages.Traced:
   """Returns `traced` with Rebindables rebound per `rule`, without retracing.
 
-  `rule` maps a site `key` (see `rebindable`) to new hyperparameters, or is a
+  `rule` maps a site's `rebindable_id` to new hyperparameters, or is a
   callable `RebindableSite -> dict | None`; sites it maps to None are unchanged.
   Rebound bodies are traced when the result is lowered, inside the original
   context (mesh, axis env) of each site.
@@ -358,7 +365,8 @@ def rebind(traced: stages.Traced, rule) -> stages.Traced:
   if not callable(rule) and not rule:
     return traced
   get = rule if callable(rule) else (
-      lambda site: None if site.key is None else rule.get(site.key))
+      lambda site: None if site.rebindable_id is None
+      else rule.get(site.rebindable_id))
   rebind_site = lambda site: (hp := get(site)) and site.rebindable.rebind(**hp)
   new = _map_rebindables(traced.jaxpr, [], rebind_site)
   return traced if new is traced.jaxpr else traced.replace_jaxpr(new)

@@ -10,7 +10,7 @@ retracing the program. Typical use:
 1. Wrap a kernel with :func:`rebindable`, declaring its hyperparameters.
 2. Trace the program with ``jax.jit(f).trace(*args)`` and list its call sites
    with :func:`extract_rebindables`. Each :class:`RebindableSite` exposes the
-   ``rebindable`` that runs (function, hyperparameters, operand types, ``key``)
+   ``rebindable`` that runs (function, hyperparameters, operand types, ``rebindable_id``)
    and the ``ctx`` it was called in (mesh, ``xla_metadata``, ...).
 3. Benchmark a site alone with :meth:`RebindableSite.call` on operands of its
    types, e.g. on a submesh where each shard sees the site's per-shard types.

@@ -101,18 +101,18 @@ class RebindableTest(jtu.JaxTestCase):
                                 "explicit argument"):
       jax.jit(closes_over).trace(x)
 
-  def test_rebind_sites_by_key(self):
+  def test_rebind_sites_by_rebindable_id(self):
     @partial(rebindable, hyperparams='k')
     def scale(x, *, k):
       return x * k
     head = rebindable(lambda x, *, k: x * k, hyperparams='k', name='scale',
-                   key='head')
+                   rebindable_id='head')
 
     x = jnp.ones(4)
     traced = jax.jit(
         lambda x: (scale(x, k=2.), head(x, k=2.), head(3. * x, k=2.))
     ).trace(x)
-    self.assertEqual([s.key for s in extract_rebindables(traced)],
+    self.assertEqual([s.rebindable_id for s in extract_rebindables(traced)],
                      [None, 'head', 'head'])
     rebound = rebind(traced, {'head': dict(k=5.)})
     self.assertEqual([s.rebindable.hyperparams['k']
@@ -120,6 +120,25 @@ class RebindableTest(jtu.JaxTestCase):
     self.assertAllClose(rebound.lower().compile()(x), (2 * x, 5 * x, 15 * x))
     self.assertIs(rebind(traced, {}), traced)
     self.assertIs(rebind(traced, {'tail': dict(k=5.)}), traced)
+
+  def test_rebindable_id_call_override(self):
+    @partial(rebindable, hyperparams='k', static_argnames='act',
+             rebindable_id='scale')
+    def scale(x, *, act, k=2.):
+      return act(x) * k
+
+    x = jnp.ones(4)
+    f = lambda x: (scale(x, act=jnp.sin),
+                   scale(x, act=jnp.tanh, rebindable_id=('scale', 'tanh')),
+                   scale(x, act=jnp.cos, rebindable_id=None))
+    traced = jax.jit(f).trace(x)
+    self.assertEqual([s.rebindable_id for s in extract_rebindables(traced)],
+                     ['scale', ('scale', 'tanh'), None])
+    rebound = rebind(traced, {('scale', 'tanh'): dict(k=5.)})
+    self.assertAllClose(rebound.lower().compile()(x),
+                        (2. * jnp.sin(x), 5. * jnp.tanh(x), 2. * jnp.cos(x)))
+    with self.assertRaisesRegex(TypeError, "reserves"):
+      rebindable(lambda x, rebindable_id: x, hyperparams=())
 
   def test_site_call_on_one_chip_and_on_a_replica_group(self):
     if jax.device_count() < 2:
@@ -129,7 +148,7 @@ class RebindableTest(jtu.JaxTestCase):
       del bm
       return jnp.sin(x)
 
-    @partial(rebindable, hyperparams='bm', key='summed')
+    @partial(rebindable, hyperparams='bm', rebindable_id='summed')
     def summed(x, *, bm):  # communicates over 'data'
       del bm
       return x + jax.lax.psum(x, 'data')

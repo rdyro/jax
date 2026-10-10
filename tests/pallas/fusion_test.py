@@ -1075,9 +1075,9 @@ class FusionHijaxTest(jtu.JaxTestCase):
 
     traces.clear()
     rebound = rebindable_lib.rebind(traced, lambda t: dict(bm=32, bn=64))
-    self.assertEqual(traces, [])  # rebinding is lazy
-    out1, out2 = rebound.lower().compile()(x, y, residual)
     self.assertEqual(traces, [(32, 64, True)])  # one trace, with fusions
+    out1, out2 = rebound.lower().compile()(x, y, residual)
+    self.assertLen(traces, 1)  # lowering traces no bodies
     expected = jnp.dot(x * 2.0, y)
     np.testing.assert_allclose(out1, expected + residual)
     np.testing.assert_allclose(out2, jax.nn.relu(expected))

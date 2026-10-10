@@ -54,12 +54,8 @@ class _BodyStack(threading.local):
 _bodies = _BodyStack()
 
 
-# Keyed on a Rebindable's identity, including the trace context it was first
-# bound in instead of the ambient one, so lowering (in any context) reuses that
-# body.
-@partial(weakref_lru_cache, trace_context_in_key=False)
-def _trace_cached(fn, in_tree, in_avals_flat, hp_items, trace_context):
-  del trace_context  # part of the key only
+@weakref_lru_cache
+def _trace_cached(fn, in_tree, in_avals_flat, hp_items):
   in_avals, hyperparams = tree_unflatten(in_tree, in_avals_flat), dict(hp_items)
   static = tuple(hyperparams)
   prev, _bodies.names = _bodies.names, (*_bodies.names, fun_name(fn))
@@ -88,10 +84,11 @@ _rule = _jax.config.Config[Any]("rebindable_rule", None,
 class Rebindable(HiPrim):
   """An application of `fn(*args, **hyperparams)` with rebindable hyperparams.
 
-  Hyperparameters are static and must not change the output types, so
-  `rebind` is O(1): the body is traced again only when the rebound application
-  is lowered, inside its original context (mesh, axis env). Transformations
-  that map over `fn` (vmap, fuser physicalization) keep it a Rebindable. To
+  `jaxpr` is the body traced for `hyperparams`, and `fn` the recipe to trace it
+  for others. Hyperparameters must not change the output types; `rebind`
+  traces the body for new ones, in the current context (see
+  `RebindableSite.rebind`). Transformations (vmap, fuser physicalization) map
+  over both `fn` and `jaxpr`, so they keep it a Rebindable. To
   remat a Rebindable is one opaque operation: remat2 asks the policy about the
   whole call, remat3 recomputes it (as it does any operation without a remat
   rule).
@@ -101,12 +98,12 @@ class Rebindable(HiPrim):
   rule: Callable | None  # applied when lowered (see `rebinding`)
   name: str
   rebindable_id: Hashable
-  trace_context: Any  # config.trace_context() when first bound
+  jaxpr: core.Jaxpr  # the body, for `hyperparams`
 
   def __init__(self, fn, hyperparams, in_avals, *, hp_names, name,
-               rebindable_id=None, rule=None, trace_context=None,
-               out_type=None):
-    # `out_type` is `(out_aval, effects)` if already known, e.g. when rebinding.
+               rebindable_id=None, rule=None, jaxpr=None, out_tree=None):
+    # `jaxpr` (with the `out_tree` of its outputs) if already known, e.g. from
+    # a transformation; otherwise traced from `fn`.
     for k, v in hyperparams.items():
       try:
         hash(v)
@@ -114,52 +111,46 @@ class Rebindable(HiPrim):
         raise TypeError(
             f"{name} hyperparameter {k}={v!r} is not hashable") from None
     self.in_avals = tuple(in_avals)
-    if trace_context is None:
-      trace_context = config.trace_context()
-    hp_items = tuple(sorted(hyperparams.items()))
-    if out_type is None:
+    if jaxpr is None:
       leaves, tree = tracing_registry.flatten(self.in_avals)
-      jaxpr, out_avals = _trace_cached(fn, tree, tuple(leaves), hp_items,
-                                       trace_context)
-      out_type = out_avals.unflatten(), core.positional_effects(jaxpr)
-    self.out_aval, self.effects = out_type[0], frozenset(out_type[1])
-    self.params = dict(fn=fn, hyperparams=hp_items, hp_names=hp_names,
-                       name=name, rebindable_id=rebindable_id, rule=rule,
-                       trace_context=trace_context, in_avals=self.in_avals)
+      jaxpr, out_avals = _trace_cached(fn, tree, tuple(leaves),
+                                       tuple(sorted(hyperparams.items())))
+      out_tree = out_avals.tree
+    self.out_aval = tree_unflatten(out_tree, jaxpr.out_avals)
+    self.effects = frozenset(core.positional_effects(jaxpr))
+    self.params = dict(fn=fn, hyperparams=tuple(sorted(hyperparams.items())),
+                       hp_names=hp_names, name=name,
+                       rebindable_id=rebindable_id, rule=rule, jaxpr=jaxpr,
+                       in_avals=self.in_avals)
     super().__init__()
 
-  def _new(self, fn, hyperparams, in_avals, out_type=None,
+  def _new(self, fn, hyperparams, in_avals, jaxpr=None,
            rule=None) -> Rebindable:
     return Rebindable(fn, hyperparams, in_avals, hp_names=self.hp_names,
-                   name=self.name, rebindable_id=self.rebindable_id, rule=rule,
-                   trace_context=self.trace_context, out_type=out_type)
+                      name=self.name, rebindable_id=self.rebindable_id,
+                      rule=rule, jaxpr=jaxpr, out_tree=self.out_tree)
 
   hyperparams = property(lambda self: dict(self.params["hyperparams"]))
 
   def pp_params(self):
     return dict(name=self.name, **self.hyperparams)
 
-  def rebind(self, **hyperparams) -> Rebindable:
+  def _rebound(self, hyperparams):
     if unknown := set(hyperparams) - set(self.hp_names):
       raise ValueError(f"{self.name} has no hyperparameters {sorted(unknown)}")
-    return self._new(self.fn, {**self.hyperparams, **hyperparams},
-                     self.in_avals, (self.out_aval, self.effects))
+    return {**self.hyperparams, **hyperparams}
 
-  @property
-  def jaxpr(self) -> core.Jaxpr:
-    """The body, traced (and cached) for the current hyperparameters."""
-    jaxpr, out_avals = _trace_cached(
-        self.fn, self.in_tree, tuple(self.in_avals_flat),
-        self.params["hyperparams"], self.trace_context)
-    effects = frozenset(core.positional_effects(jaxpr))
-    if (list(out_avals) != self.out_avals_flat
-        or out_avals.tree != self.out_tree or effects != self.effects):
+  def rebind(self, **hyperparams) -> Rebindable:
+    """Traces the body for `hyperparams`, in the current context."""
+    new = self._new(self.fn, self._rebound(hyperparams), self.in_avals)
+    if (new.out_avals_flat != self.out_avals_flat
+        or new.out_tree != self.out_tree or new.effects != self.effects):
       raise TypeError(
           f"{self.name} output types and effects must not depend on its "
-          f"hyperparameters, but {self.hyperparams} changed them from "
-          f"{self.out_aval}, {set(self.effects)} to {out_avals.unflatten()}, "
-          f"{set(effects)}")
-    return jaxpr
+          f"hyperparameters, but {new.hyperparams} changed them from "
+          f"{self.out_aval}, {set(self.effects)} to {new.out_aval}, "
+          f"{set(new.effects)}")
+    return new
 
   def expand(self, *args):
     # Lowering expands only the calls left in the final program, each in its
@@ -167,30 +158,31 @@ class Rebindable(HiPrim):
     if self.rule is not None and (
         hp := self.rule(RebindableSite(self, core.JaxprEqnContext(), None))):
       return self.rebind(**hp).expand(*args)
-    jaxpr = self.jaxpr
-    out = core.eval_jaxpr(jaxpr, jaxpr.consts,
+    out = core.eval_jaxpr(self.jaxpr, self.jaxpr.consts,
                           *tree_leaves_checked(self.in_tree, args))
     return tree_unflatten(self.out_tree, out)
 
-  def _map_fn(self, transform, *args):
-    return self._new(transform(self.fn), self.hyperparams,
-                     _typeof_tree(args), rule=self.rule)(*args)
+  def _map_fn(self, transform, jaxpr, *args):
+    # A transformation of both the recipe `fn` and the body `jaxpr`.
+    return self._new(transform(self.fn), self.hyperparams, _typeof_tree(args),
+                     jaxpr=jaxpr, rule=self.rule)(*args)
 
   def batch(self, axis_data, args, dims):
-    _, out_dims = batching.batch_jaxpr2(
+    jaxpr, out_dims = batching.batch_jaxpr2(
         self.jaxpr, axis_data, tuple(self.in_tree.flatten_up_to(dims)))
     out_dims = tree_unflatten(self.out_tree, out_dims)
     vmap = lambda fn: lambda *xs, **hp: api.vmap(
         partial(fn, **hp), in_axes=dims, out_axes=out_dims,
         axis_size=axis_data.size, axis_name=axis_data.name,
         spmd_axis_name=axis_data.spmd_name or axis_data.explicit_mesh_axis)(*xs)
-    return self._map_fn(vmap, *args), out_dims
+    return self._map_fn(vmap, jaxpr, *args), out_dims
 
   def physicalize(self, ctx, *args_flat):
     phys = lambda fn: ctx.physicalize(
         fn, static_argnames=tuple(self.hyperparams))
+    jaxpr = ctx.physicalize_closed_jaxpr(self.jaxpr)
     return tree_leaves(
-        self._map_fn(phys, *tree_unflatten(self.in_tree, args_flat)))
+        self._map_fn(phys, jaxpr, *tree_unflatten(self.in_tree, args_flat)))
 
   def _no_ad(self, *_, **__):
     # Residuals of a differentiated body generally depend on the
@@ -300,17 +292,21 @@ class RebindableSite:
     apply the call's metadata with `set_xla_metadata(**(self.ctx.xla_metadata
     or {}))`, and create refs for in-place operands.
     """
-    t = self.rebindable.rebind(**hyperparams)
-    return t.fn(*tree_unflatten(t.in_tree, args_flat), **t.hyperparams)
+    t = self.rebindable
+    return t.fn(*tree_unflatten(t.in_tree, args_flat),
+                **t._rebound(hyperparams))
 
   @property
   def jaxpr(self) -> core.Jaxpr:
-    """The body, traced inside the call's mesh and manual axes."""
+    return self.rebindable.jaxpr
+
+  def rebind(self, **hyperparams) -> Rebindable:
+    """The call rebound, its body traced in the call's mesh and manual axes."""
     mesh, t = self.abstract_mesh, self.rebindable
     with (self.ctx.manager, config._check_vma(_checks_vma(t)),
           core.extend_axis_env_nd(
               [(n, mesh.shape[n]) for n in mesh.manual_axes])):
-      return t.jaxpr
+      return t.rebind(**hyperparams)
 
 
 def _checks_vma(p: Rebindable) -> bool:
@@ -419,12 +415,12 @@ def rebind(traced: stages.Traced, rule) -> stages.Traced:
 
   `rule` maps a site's `rebindable_id` to new hyperparameters, or is a
   callable `RebindableSite -> dict | None`; sites it maps to None are unchanged.
-  Rebound bodies are traced when the result is lowered, inside the original
-  context (mesh, axis env) of each site.
+  Rebound bodies are traced here, each in its site's context (mesh, manual
+  axes); the rest of the program is not retraced.
   """
   if not callable(rule) and not rule:
     return traced
   get = _as_rule(rule)
-  rebind_site = lambda site: (hp := get(site)) and site.rebindable.rebind(**hp)
+  rebind_site = lambda site: (hp := get(site)) and site.rebind(**hp)
   new = _map_rebindables(traced.jaxpr, [], rebind_site)
   return traced if new is traced.jaxpr else traced.replace_jaxpr(new)

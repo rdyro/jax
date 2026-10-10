@@ -28,7 +28,7 @@ jtu.request_cpu_devices(2)
 
 class RebindableTest(jtu.JaxTestCase):
 
-  def test_rebindable_extract_and_lazy_rebind(self):
+  def test_rebindable_extract_and_rebind(self):
     traces = []
 
     @partial(rebindable, hyperparams=('bm', 'bn'))
@@ -50,14 +50,13 @@ class RebindableTest(jtu.JaxTestCase):
     self.assertEqual(sites[0].rebindable.hyperparams, {'bm': 16, 'bn': 32})
 
     rebound = rebind(traced, lambda t: dict(bm=32, bn=64))
-    self.assertLen(traces, 2)  # rebinding does not trace anything
+    self.assertEqual(traces[2:], [(32, 64)] * 2)  # one trace per rebound site
     self.assertEqual(
         [s.rebindable.hyperparams for s in extract_rebindables(rebound)],
         [{'bm': 32, 'bn': 64}] * 2)
     out_orig = traced.lower().compile()(x, y)
-    self.assertLen(traces, 2)  # lowering the original again hits the cache
     out_rebound = rebound.lower().compile()(x, y)
-    self.assertEqual(traces[2:], [(32, 64)] * 2)  # one trace per rebound site
+    self.assertLen(traces, 4)  # lowering traces no bodies
     self.assertAllClose(out_orig, out_rebound)
     with self.assertRaisesRegex(ValueError, "no hyperparameters"):
       sites[0].rebindable.rebind(bk=8)
@@ -321,9 +320,8 @@ class RebindableTest(jtu.JaxTestCase):
     def f(x, *, n):
       return x[:n]
     traced = jax.jit(lambda x: f(x, n=2)).trace(jnp.ones(4))
-    rebound = rebind(traced, lambda t: dict(n=3))
     with self.assertRaisesRegex(TypeError, "must not depend on"):
-      rebound.lower()
+      rebind(traced, lambda t: dict(n=3))
 
   def test_rebindable_rejects_direct_ad(self):
     op = rebindable(lambda x, *, bm: x * 2.0, hyperparams='bm')

@@ -61,35 +61,45 @@ class RebindableTest(jtu.JaxTestCase):
     self.assertAllClose(out_orig, out_rebound)
     with self.assertRaisesRegex(ValueError, "no hyperparameters"):
       sites[0].rebindable.rebind(bk=8)
-    with self.assertRaisesRegex(TypeError, "missing hyperparameters"):
-      tiled_dot(x, y, bm=16)
+    with self.assertRaisesRegex(TypeError, "missing 1 required keyword"):
+      tiled_dot(x, y, bm=16)  # Python's own error, from tracing `fn`
     self.assertIs(rebind(traced, lambda s: None), traced)
 
-  def test_rebindable_declared_hyperparams_and_static_kwargs(self):
+  def test_rebindable_static_args_and_array_kwargs(self):
     traces = []
 
-    @partial(rebindable, hyperparams=('bm',))
-    def kernel(x, *, bm=8, scale, table):
+    @partial(rebindable, hyperparams='bm', static_argnums=1,
+             static_argnames='table')
+    def kernel(x, scale, *, bias, bm=8, table):
       traces.append(bm)
-      return x * scale + table['bias']
+      return x * scale + bias + table[0]
 
     x = jnp.ones(4, jnp.float32)
-    # `scale` and the unhashable `table` dict are static config, not hp.
-    f = lambda a: kernel(a, scale=3.0, table={'bias': 1.0})
-    traced = jax.jit(f).trace(x)
+    # `scale` and `table` are static; the `bias` keyword is an operand.
+    f = lambda a, b: kernel(a, 3.0, bias=b, table=(1.0,))
+    traced = jax.jit(f).trace(x, x)
     [site] = extract_rebindables(traced)
-    self.assertEqual(site.rebindable.hyperparams, {'bm': 8})  # default recorded
+    self.assertEqual(site.rebindable.hyperparams, {})  # `fn`'s default applies
+    self.assertEqual([a.shape for a in site.rebindable.in_avals_flat],
+                     [(4,), (4,)])
     self.assertEqual(site.name, 'kernel')
     rebound = rebind(traced, lambda s: dict(bm=16))
-    self.assertAllClose(rebound.lower().compile()(x), x * 3.0 + 1.0)
+    self.assertEqual(extract_rebindables(rebound)[0].rebindable.hyperparams,
+                     {'bm': 16})
+    self.assertAllClose(rebound.lower().compile()(x, x), x * 3.0 + x + 1.0)
     self.assertEqual(traces, [8, 16])
     with self.assertRaisesRegex(ValueError, "no hyperparameters"):
-      site.rebindable.rebind(scale=4.0)  # static kwargs are not rebindable
+      site.rebindable.rebind(table=(4.0,))  # static, but not rebindable
+    # Static arguments are closed over, so they need not be hashable.
+    g = jax.jit(lambda a: kernel(a, 3.0, bias=a, table=[1.0]))
+    self.assertAllClose(g(x), x * 3.0 + x + 1.0)
     with self.assertRaisesRegex(TypeError, "not hashable"):
-      jax.jit(lambda a: kernel(a, bm=[8], scale=3., table={})).trace(x)
+      jax.jit(lambda a: kernel(a, 3.0, bias=a, bm=[8], table=(1.0,))).trace(x)
+    closes_over = lambda a: rebindable(lambda x, *, bm=8: x * a,
+                                       hyperparams='bm')(a)
     with self.assertRaisesRegex(jax.errors.UnexpectedTracerError,
                                 "explicit argument"):
-      jax.jit(lambda a: kernel(a, scale=a, table={'bias': 1.0})).trace(x)
+      jax.jit(closes_over).trace(x)
 
   def test_rebind_sites_by_key(self):
     @partial(rebindable, hyperparams='k')

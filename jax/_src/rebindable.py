@@ -16,15 +16,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Sequence
 import dataclasses
 from functools import partial, update_wrapper
-import inspect
 import operator
 import threading
 from typing import Any
 
 from jax._src import api
+from jax._src import api_util
 from jax._src import config
 from jax._src import core
 from jax._src import flattree as ft
@@ -88,11 +88,12 @@ class Rebindable(HiPrim):
   rule).
   """
   fn: Callable
+  hp_names: tuple[str, ...]  # those it may be rebound with
   name: str
   key: Hashable
   trace_context: Any  # config.trace_context() when first bound
 
-  def __init__(self, fn, hyperparams, in_avals, *, name, key=None,
+  def __init__(self, fn, hyperparams, in_avals, *, hp_names, name, key=None,
                trace_context=None, out_type=None):
     # `out_type` is `(out_aval, effects)` if already known, e.g. when rebinding.
     for k, v in hyperparams.items():
@@ -111,14 +112,14 @@ class Rebindable(HiPrim):
                                        trace_context)
       out_type = out_avals.unflatten(), core.positional_effects(jaxpr)
     self.out_aval, self.effects = out_type[0], frozenset(out_type[1])
-    self.params = dict(fn=fn, hyperparams=hp_items,
+    self.params = dict(fn=fn, hyperparams=hp_items, hp_names=hp_names,
                        name=name, key=key,
                        trace_context=trace_context, in_avals=self.in_avals)
     super().__init__()
 
   def _new(self, fn, hyperparams, in_avals, out_type=None) -> Rebindable:
-    return Rebindable(fn, hyperparams, in_avals, name=self.name,
-                   key=self.key,
+    return Rebindable(fn, hyperparams, in_avals, hp_names=self.hp_names,
+                   name=self.name, key=self.key,
                    trace_context=self.trace_context, out_type=out_type)
 
   hyperparams = property(lambda self: dict(self.params["hyperparams"]))
@@ -127,7 +128,7 @@ class Rebindable(HiPrim):
     return dict(name=self.name, **self.hyperparams)
 
   def rebind(self, **hyperparams) -> Rebindable:
-    if unknown := set(hyperparams) - set(self.hyperparams):
+    if unknown := set(hyperparams) - set(self.hp_names):
       raise ValueError(f"{self.name} has no hyperparameters {sorted(unknown)}")
     return self._new(self.fn, {**self.hyperparams, **hyperparams},
                      self.in_avals, (self.out_aval, self.effects))
@@ -185,27 +186,30 @@ class Rebindable(HiPrim):
 
 
 def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
-            name: str | None = None, key: Hashable = None):
+               static_argnums: int | Sequence[int] | None = None,
+               static_argnames: str | Iterable[str] | None = None,
+               name: str | None = None, key: Hashable = None):
   """Stages calls `fn(*args, **kwargs)` as :class:`Rebindable`s.
 
-  Positional arguments are operands: pytrees of arrays, or fuser `Fusion`s, so
+  `hyperparams` names the keyword arguments a tuner may rebind: hashable and
+  static, passed by keyword (`fn`'s defaults apply to any not passed). As with
+  `jax.jit`, `static_argnums` and `static_argnames` mark other static
+  arguments; all others are operands: pytrees of arrays, or fuser `Fusion`s, so
   a rebindable called inside a `fuser.fusible` body takes the fused prologue and
-  epilogue as inputs. The keyword arguments named in `hyperparams` are the
-  hashable, static values a tuner may rebind (defaults in `fn`'s signature are
-  recorded when not passed). Any other keyword arguments are fixed static
-  configuration: bound to `fn` as-is, never hashed or exposed for rebinding.
-  Hyperparameter-dependent ops written in the body run inside the kernel's
-  trace but are not fused as prologue/epilogue; build such a `Fusion`
-  explicitly if needed. `key` is an optional hashable label for the call's
-  sites, e.g. to rebind them from a table of tuned values.
+  epilogue as inputs. Hyperparameter-dependent ops written in the body run
+  inside the kernel's trace but are not fused as prologue/epilogue; build such
+  a `Fusion` explicitly if needed. `key` is an optional hashable label for the
+  call's sites, e.g. to rebind them from a table of tuned values.
   """
   if fn is None:
-    return partial(rebindable, hyperparams=hyperparams, name=name, key=key)
+    return partial(rebindable, hyperparams=hyperparams,
+                   static_argnums=static_argnums,
+                   static_argnames=static_argnames, name=name, key=key)
   hp_names = ((hyperparams,) if isinstance(hyperparams, str)
               else tuple(hyperparams))
-  sig = inspect.signature(fn).parameters
-  defaults = {k: sig[k].default for k in hp_names
-              if k in sig and sig[k].default is not inspect.Parameter.empty}
+  _, _, static_argnums, static_argnames = api_util.resolve_argnums(
+      fn, api_util.fun_signature(fn), None, None, static_argnums,
+      static_argnames)
   op_name = name or fun_name(fn)
 
   @traceback_util.api_boundary
@@ -216,12 +220,16 @@ def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
           f"{_bodies.names[-1]}; nested rebindables are not supported. Make "
           f"{op_name} a plain function of the outer rebindable's "
           "hyperparameters.")
-    hp = {**defaults, **{k: kwargs.pop(k) for k in hp_names if k in kwargs}}
-    if missing := set(hp_names) - hp.keys():
-      raise TypeError(f"{op_name} missing hyperparameters {sorted(missing)}")
-    f = partial(fn, **kwargs) if kwargs else fn
-    return Rebindable(f, hp, _typeof_tree(args), name=op_name,
-                   key=key)(*args)
+    hp = {k: kwargs.pop(k) for k in hp_names if k in kwargs}
+    in_ft = ft.flatten_static_argnums_argnames(
+        args, kwargs, static_argnums, static_argnames)
+
+    def body(*operands, **hp):  # closes over the static arguments
+      args, kwargs = in_ft.update(operands).unflatten()
+      return fn(*args, **kwargs, **hp)
+    body.__name__ = op_name
+    return Rebindable(body, hp, map(typeof, in_ft.vals), hp_names=hp_names,
+                      name=op_name, key=key)(*in_ft.vals)
   return update_wrapper(wrapper, fn)
 
 

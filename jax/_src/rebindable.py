@@ -36,6 +36,7 @@ from jax._src.errors import UnexpectedTracerError
 from jax._src.hijax import HiPrim
 from jax._src.interpreters import batching
 from jax._src.interpreters import partial_eval as pe
+from jax._src.lib import _jax
 from jax._src.tree_util import (
     tracing_registry, tree_leaves, tree_leaves_checked, tree_unflatten)
 from jax._src.util import fun_name, weakref_lru_cache
@@ -76,6 +77,14 @@ def _trace_cached(fn, in_tree, in_avals_flat, hp_items, trace_context):
   return jaxpr, out_avals
 
 
+# The rule calls are rebound with (see `rebinding`). Like the abstract mesh, it
+# is a jit cache key, and calls capture it when bound, so that lowering outside
+# the `with` applies it too.
+_rule = _jax.config.Config[Any]("rebindable_rule", None,
+                                include_in_jit_key=True,
+                                include_in_trace_context=True)
+
+
 class Rebindable(HiPrim):
   """An application of `fn(*args, **hyperparams)` with rebindable hyperparams.
 
@@ -89,12 +98,14 @@ class Rebindable(HiPrim):
   """
   fn: Callable
   hp_names: tuple[str, ...]  # those it may be rebound with
+  rule: Callable | None  # applied when lowered (see `rebinding`)
   name: str
   rebindable_id: Hashable
   trace_context: Any  # config.trace_context() when first bound
 
   def __init__(self, fn, hyperparams, in_avals, *, hp_names, name,
-               rebindable_id=None, trace_context=None, out_type=None):
+               rebindable_id=None, rule=None, trace_context=None,
+               out_type=None):
     # `out_type` is `(out_aval, effects)` if already known, e.g. when rebinding.
     for k, v in hyperparams.items():
       try:
@@ -113,13 +124,14 @@ class Rebindable(HiPrim):
       out_type = out_avals.unflatten(), core.positional_effects(jaxpr)
     self.out_aval, self.effects = out_type[0], frozenset(out_type[1])
     self.params = dict(fn=fn, hyperparams=hp_items, hp_names=hp_names,
-                       name=name, rebindable_id=rebindable_id,
+                       name=name, rebindable_id=rebindable_id, rule=rule,
                        trace_context=trace_context, in_avals=self.in_avals)
     super().__init__()
 
-  def _new(self, fn, hyperparams, in_avals, out_type=None) -> Rebindable:
+  def _new(self, fn, hyperparams, in_avals, out_type=None,
+           rule=None) -> Rebindable:
     return Rebindable(fn, hyperparams, in_avals, hp_names=self.hp_names,
-                   name=self.name, rebindable_id=self.rebindable_id,
+                   name=self.name, rebindable_id=self.rebindable_id, rule=rule,
                    trace_context=self.trace_context, out_type=out_type)
 
   hyperparams = property(lambda self: dict(self.params["hyperparams"]))
@@ -150,6 +162,11 @@ class Rebindable(HiPrim):
     return jaxpr
 
   def expand(self, *args):
+    # Lowering expands only the calls left in the final program, each in its
+    # eqn's context, so the rule sees the types and mesh its site has.
+    if self.rule is not None and (
+        hp := self.rule(RebindableSite(self, core.JaxprEqnContext(), None))):
+      return self.rebind(**hp).expand(*args)
     jaxpr = self.jaxpr
     out = core.eval_jaxpr(jaxpr, jaxpr.consts,
                           *tree_leaves_checked(self.in_tree, args))
@@ -157,7 +174,7 @@ class Rebindable(HiPrim):
 
   def _map_fn(self, transform, *args):
     return self._new(transform(self.fn), self.hyperparams,
-                     _typeof_tree(args))(*args)
+                     _typeof_tree(args), rule=self.rule)(*args)
 
   def batch(self, axis_data, args, dims):
     _, out_dims = batching.batch_jaxpr2(
@@ -236,7 +253,8 @@ def rebindable(fn: Callable | None = None, *, hyperparams: str | Sequence[str],
       return fn(*args, **kwargs, **hp)
     body.__name__ = op_name
     return Rebindable(body, hp, map(typeof, in_ft.vals), hp_names=hp_names,
-                      name=op_name, rebindable_id=id_)(*in_ft.vals)
+                      name=op_name, rebindable_id=id_,
+                      rule=_rule.value)(*in_ft.vals)
   return update_wrapper(wrapper, fn)
 
 
@@ -354,6 +372,48 @@ def extract_rebindables(traced: stages.Traced) -> list[RebindableSite]:
   return sites
 
 
+@dataclasses.dataclass(frozen=True)
+class _ById:
+  """A rule from site ids to hyperparameters, equal to equal tables."""
+  table: frozenset[tuple[Hashable, tuple[tuple[str, Hashable], ...]]]
+
+  def __call__(self, site):
+    return next((dict(hp) for i, hp in self.table
+                 if site.rebindable_id is not None
+                 and i == site.rebindable_id), None)
+
+
+def _as_rule(rule) -> Callable:
+  if callable(rule):
+    return rule
+  return _ById(frozenset((i, tuple(sorted(hp.items())))
+                         for i, hp in rule.items()))
+
+
+class rebinding:
+  """Rebinds the rebindables called in this context when they are lowered.
+
+  `rule` is as for :func:`rebind`: a callable `RebindableSite -> dict | None`
+  or a dict from site `rebindable_id` to hyperparameters. It is applied to the
+  calls left in the program when it is lowered, so it sees each site's final
+  operand types (e.g. batched by `vmap`, per shard in a `shard_map`) and mesh,
+  as `rebind` after tracing would. Calls capture the rule when traced, so
+  lowering outside the context applies it too, and the rule is a jit cache key
+  (a dict by its contents, a callable by identity). An inner context replaces
+  an outer one, and an explicit :func:`rebind` replaces the rule.
+  """
+  __slots__ = ["rule", "prev"]
+
+  def __init__(self, rule):
+    self.rule = _as_rule(rule)
+
+  def __enter__(self):
+    self.prev = _rule.swap_local(self.rule)
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    _rule.set_local(self.prev)
+
+
 def rebind(traced: stages.Traced, rule) -> stages.Traced:
   """Returns `traced` with Rebindables rebound per `rule`, without retracing.
 
@@ -364,9 +424,7 @@ def rebind(traced: stages.Traced, rule) -> stages.Traced:
   """
   if not callable(rule) and not rule:
     return traced
-  get = rule if callable(rule) else (
-      lambda site: None if site.rebindable_id is None
-      else rule.get(site.rebindable_id))
+  get = _as_rule(rule)
   rebind_site = lambda site: (hp := get(site)) and site.rebindable.rebind(**hp)
   new = _map_rebindables(traced.jaxpr, [], rebind_site)
   return traced if new is traced.jaxpr else traced.replace_jaxpr(new)

@@ -19,5 +19,6 @@ from jax._src.rebindable import (
     RebindableSite as RebindableSite,
     extract_rebindables as extract_rebindables,
     rebind as rebind,
+    rebinding as rebinding,
     rebindable as rebindable,
 )

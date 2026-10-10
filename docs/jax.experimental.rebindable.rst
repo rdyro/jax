@@ -15,7 +15,8 @@ retracing the program. Typical use:
 3. Benchmark a site alone with :meth:`RebindableSite.call` on operands of its
    types, e.g. on a submesh where each shard sees the site's per-shard types.
 4. Apply the winners with :func:`rebind` and lower the result; only
-   the rebound kernels are retraced.
+   the rebound kernels are retraced. Or trace (e.g. call a `jax.jit` function)
+   under :func:`rebinding` with the same rule, which applies it when lowering.
 
 Rebindables are never differentiated (call them from the rules of a
 :func:`jax.custom_vjp` instead) and cannot be nested.
@@ -31,5 +32,6 @@ API
   rebindable
   extract_rebindables
   rebind
+  rebinding
   Rebindable
   RebindableSite

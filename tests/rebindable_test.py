@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jax._src import config
 from jax._src import test_util as jtu
 from jax.experimental.rebindable import (
-    extract_rebindables, rebind, rebindable)
+    extract_rebindables, rebind, rebindable, rebinding)
 
 config.parse_flags_with_absl()
 jtu.request_cpu_devices(2)
@@ -139,6 +139,73 @@ class RebindableTest(jtu.JaxTestCase):
                         (2. * jnp.sin(x), 5. * jnp.tanh(x), 2. * jnp.cos(x)))
     with self.assertRaisesRegex(TypeError, "reserves"):
       rebindable(lambda x, rebindable_id: x, hyperparams=())
+
+  def test_rebinding_applies_the_rule_when_lowered(self):
+    traces = []
+
+    @partial(rebindable, hyperparams='k', rebindable_id='scale')
+    def scale(x, *, k=2.):
+      traces.append(k)
+      return x * k
+
+    x = jnp.ones(4)
+    f = jax.jit(lambda x: scale(x))
+    with rebinding({'scale': dict(k=5.)}):
+      self.assertAllClose(f(x), 5. * x)
+      traced = f.trace(x)
+    self.assertAllClose(f(x), 2. * x)  # the rule is a jit cache key
+    with rebinding({'scale': dict(k=5.)}):
+      self.assertAllClose(f(x), 5. * x)  # equal tables hit the cache
+    # Captured when traced: lowering outside the context applies it too.
+    self.assertAllClose(traced.lower().compile()(x), 5. * x)
+    # An explicit rebind replaces the rule.
+    rebound = rebind(traced, lambda s: dict(k=7.))
+    self.assertAllClose(rebound.lower().compile()(x), 7. * x)
+    with rebinding({'scale': dict(k=5.)}), rebinding({}):
+      self.assertAllClose(f(x), 2. * x)  # the inner context replaces
+
+  def test_rebinding_rule_sees_final_types(self):
+    @partial(rebindable, hyperparams='k')
+    def scale(x, *, k=2.):
+      return x * k
+
+    seen = []
+    def rule(site):  # keyed on the types extract_rebindables reports
+      shapes = tuple(a.shape for a in site.rebindable.in_avals_flat)
+      seen.append(shapes)
+      return dict(k=5.) if shapes == ((2, 3, 4),) else None
+
+    xs = jnp.ones((2, 3, 4))
+    f = jax.jit(jax.vmap(jax.vmap(lambda x: scale(x))))
+    with rebinding(rule):
+      self.assertAllClose(f(xs), 5. * xs)
+    self.assertEqual(seen, [((2, 3, 4),)])  # once, with the batched types
+
+  def test_rebinding_rule_sees_per_shard_types(self):
+    if jax.device_count() < 2:
+      self.skipTest('requires 2 devices')
+
+    @partial(rebindable, hyperparams='k')
+    def scale(x, *, k=2.):
+      return x * k
+
+    seen = []
+    def rule(site):
+      seen.append((site.rebindable.in_avals_flat[0].shape,
+                   site.abstract_mesh.manual_axes))
+      return dict(k=5.)
+
+    mesh = jax.make_mesh((2,), ('data',),
+                         axis_types=(jax.sharding.AxisType.Explicit,))
+    @jax.jit
+    @jax.shard_map(out_specs=jax.P('data'))
+    def f(x):
+      return scale(x)
+
+    with jax.set_mesh(mesh), rebinding(rule):
+      x = jax.device_put(jnp.arange(8.), jax.P('data'))
+      self.assertAllClose(f(x), 5. * x)
+    self.assertEqual(seen, [((4,), ('data',))])
 
   def test_site_call_on_one_chip_and_on_a_replica_group(self):
     if jax.device_count() < 2:
